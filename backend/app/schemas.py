@@ -1,0 +1,111 @@
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    role: str
+    supervisor_username: str | None = None
+
+
+class LoginResponse(Token):
+    user: UserOut
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str
+    supervisor_username: str | None = None
+
+
+class UserUpdate(BaseModel):
+    username: str | None = None
+    password: str | None = None
+    role: str | None = None
+    supervisor_username: str | None = None
+
+
+class TaskCreate(BaseModel):
+    name: str | None = None
+    chunk_size: int = 50
+    classes: list[str] = Field(default_factory=list)
+    min_role_to_add_class: str = "admin"
+    golden_per_job: int = 0
+
+
+class TaskOut(BaseModel):
+    id: int
+    name: str
+    job_num: int
+    img_num: int
+    completed_jobs: int
+    process: float
+    classes: list[str]
+    min_role_to_add_class: str
+    golden_per_job: int
+    chunk_size: int
+    created_at: str
+
+
+class JobOut(BaseModel):
+    id: int
+    task_id: int
+    state: str
+    img_num: int
+    annotator_process: int
+    review_s1_process: int
+    review_s2_process: int
+    review_stage: int | None
+    assignee_id: int | None
+    assignee_username: str | None = None
+    locked_by_id: int | None
+    locked_by_username: str | None = None
+    updated_at: str
+    progress: float
+
+
+class AssignJobIn(BaseModel):
+    assignee_id: int
+
+
+class BoxIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    class_name: str = Field(alias="class", default="")
+    box_points: str = "0.5 0.5 0.1 0.1"
+    segment_points: str = ""
+    ocr_text: str = ""
+    caption: str = ""
+    details: str = ""
+
+
+class BoxUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    class_name: str | None = Field(default=None, alias="class")
+    box_points: str | None = None
+    segment_points: str | None = None
+    ocr_text: str | None = None
+    caption: str | None = None
+    details: str | None = None
+    tag: list[str] | None = None
+    status: str | None = None
+
+
+class ImageUpdate(BaseModel):
+    caption: str | None = None
+    details: str | None = None
+    tag: list[str] | None = None
+
+
+class ExportOptions(BaseModel):
+    include_rejected: bool = True
+    job_ids: list[int] | None = None

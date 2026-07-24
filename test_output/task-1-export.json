@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "path": "/data/storage/tasks/1/jobs/1/8fa42f0b01504f4fb98b9ac814bdca2d.jpg",
+    "caption": null,
+    "bboxes": []
+  },
+  {
+    "id": 2,
+    "path": "/data/storage/tasks/1/jobs/1/9fa2a7f541d64d019908f6985e9c1547.jpg",
+    "caption": null,
+    "bboxes": []
+  },
+  {
+    "id": 3,
+    "path": "/data/storage/tasks/1/jobs/1/1aefbcc80b1a4071b10f201e573c1cfb.jpg",
+    "caption": null,
+    "bboxes": []
+  },
+  {
+    "id": 4,
+    "path": "/data/storage/tasks/1/jobs/1/21bffd06b7e84912b9224210f78c5a4c.jpg",
+    "caption": null,
+    "bboxes": []
+  }
+]
