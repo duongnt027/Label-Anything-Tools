@@ -68,37 +68,54 @@ def write_log(
 
 
 def refresh_annotator_locks(db: Session) -> None:
-    timeout = timedelta(minutes=settings.annotator_lock_timeout_minutes)
+    """Auto-unlock jobs whose holder stayed inside but idle past JOB_LOCK_TIMEOUT_MINUTES."""
+    timeout = timedelta(minutes=settings.job_lock_timeout_minutes)
     now = now_gmt7()
     jobs = (
         db.query(Job)
-        .filter(Job.state == JobState.in_progress, Job.locked_by_id.isnot(None))
+        .filter(Job.locked_by_id.isnot(None), Job.locked_at.isnot(None))
         .all()
     )
     for job in jobs:
-        last_log = (
-            db.query(Log)
-            .filter(Log.target_type == LogTargetType.job, Log.target_id == job.id)
-            .order_by(Log.created_at.desc())
-            .first()
-        )
-        if last_log is None:
+        locked_at = job.locked_at
+        if locked_at.tzinfo is None:
+            from app.models import TZ
+
+            locked_at = locked_at.replace(tzinfo=TZ)
+        if now - locked_at <= timeout:
             continue
-        if now - last_log.created_at > timeout:
-            prev = job.locked_by_id
-            job.locked_by_id = None
-            job.locked_at = None
-            write_log(
-                db,
-                actor_id=prev or job.assignee_id or 0,
-                action=LogAction.unlock_job_auto,
-                target_type=LogTargetType.job,
-                target_id=job.id,
-                detail="Auto unlock after inactivity",
-            )
+        prev = job.locked_by_id
+        job.locked_by_id = None
+        job.locked_at = None
+        write_log(
+            db,
+            actor_id=prev or job.assignee_id or 0,
+            action=LogAction.unlock_job_auto,
+            target_type=LogTargetType.job,
+            target_id=job.id,
+            detail=f"Auto unlock after {settings.job_lock_timeout_minutes}m idle inside job",
+        )
 
 
 def touch_job_lock(db: Session, job: Job, user_id: int) -> None:
     job.locked_by_id = user_id
     job.locked_at = now_gmt7()
     job.modifier_id = user_id
+
+
+def clear_job_lock(db: Session, job: Job, actor_id: int, *, detail: str = "Unlock on leave") -> bool:
+    """Clear lock if held. Returns True when a lock was cleared."""
+    if job.locked_by_id is None:
+        return False
+    prev = job.locked_by_id
+    job.locked_by_id = None
+    job.locked_at = None
+    write_log(
+        db,
+        actor_id=actor_id or prev or 0,
+        action=LogAction.unlock_job_manual,
+        target_type=LogTargetType.job,
+        target_id=job.id,
+        detail=detail,
+    )
+    return True

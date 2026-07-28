@@ -28,6 +28,10 @@ def list_boxes(image_id: int, user: User = Depends(get_current_user), db: Sessio
     return [box_to_dict(b) for b in img.boxes]
 
 
+_ACCEPT_TAGS = frozenset({"Accept S1", "Accept All"})
+_ANNOTATE_JOB_STATES = frozenset({JobState.new, JobState.rejected, JobState.in_progress})
+
+
 def _assert_image_editable(db: Session, user: User, img: Image) -> Job | None:
     if img.job_id is None:
         if user.role.value != "admin":
@@ -43,6 +47,25 @@ def _assert_image_editable(db: Session, user: User, img: Image) -> Job | None:
     return job
 
 
+def _strip_accept_tags(img: Image) -> bool:
+    """Remove Accept S1 / Accept All. Returns True if changed."""
+    tags = list(img.tag or [])
+    cleaned = [t for t in tags if t not in _ACCEPT_TAGS]
+    if cleaned != tags:
+        img.tag = cleaned
+        return True
+    return False
+
+
+def _annotator_may_clear_accept(user: User, job: Job | None) -> bool:
+    """Accept tags auto-clear only for annotator work (not reviewer edits)."""
+    if user.role == UserRole.annotator:
+        return True
+    if user.role == UserRole.admin and job and job.state in _ANNOTATE_JOB_STATES:
+        return True
+    return False
+
+
 @router.patch("/{image_id}")
 def update_image(
     image_id: int,
@@ -54,14 +77,26 @@ def update_image(
     if not img:
         raise HTTPException(404)
     job = _assert_image_editable(db, user, img)
+    caption_changed = False
     if body.caption is not None:
+        if body.caption != (img.caption or ""):
+            caption_changed = True
         img.caption = body.caption
     if body.details is not None:
         img.details = body.details
     if body.tag is not None:
         if user.role == UserRole.annotator:
             raise HTTPException(403, "Annotator cannot set image tags directly")
-        img.tag = body.tag
+        old_tags = set(img.tag or [])
+        new_tags = list(body.tag)
+        if old_tags & _ACCEPT_TAGS:
+            added = set(new_tags) - old_tags
+            if added - _ACCEPT_TAGS:
+                raise HTTPException(400, "Xóa Accept S1 / Accept All trước khi thêm tag khác")
+        img.tag = new_tags
+    # Accept S1/All: reviewer removes manually; annotator clears only via caption / add-delete box
+    if caption_changed and _annotator_may_clear_accept(user, job):
+        _strip_accept_tags(img)
     img.modifier_id = user.id
     if job:
         touch_job_lock(db, job, user.id)
@@ -76,6 +111,30 @@ def update_image(
     return image_to_dict(img)
 
 
+_GOLDEN_REF_PREFIX = "golden_pool_id:"
+
+
+def _parse_golden_ref(details: str | None) -> int | None:
+    if not details:
+        return None
+    for part in details.split("|"):
+        part = part.strip()
+        if part.startswith(_GOLDEN_REF_PREFIX):
+            try:
+                return int(part[len(_GOLDEN_REF_PREFIX) :])
+            except ValueError:
+                return None
+    return None
+
+
+def _set_golden_ref(details: str | None, golden_id: int | None) -> str | None:
+    parts = [p for p in (details or "").split("|") if p.strip() and not p.strip().startswith(_GOLDEN_REF_PREFIX)]
+    if golden_id is not None:
+        parts.append(f"{_GOLDEN_REF_PREFIX}{golden_id}")
+    joined = "|".join(parts).strip("|")
+    return joined or None
+
+
 @router.post("/{image_id}/golden-pool")
 def add_to_golden_pool(
     image_id: int,
@@ -87,6 +146,11 @@ def add_to_golden_pool(
     img = db.get(Image, image_id)
     if not img or not img.job_id:
         raise HTTPException(400)
+    existing_id = _parse_golden_ref(img.details)
+    if existing_id and db.get(Image, existing_id):
+        img.is_golden = True
+        db.commit()
+        return image_to_dict(img)
     import shutil
     from pathlib import Path
 
@@ -127,6 +191,8 @@ def add_to_golden_pool(
                 details=box.details,
             )
         )
+    img.is_golden = True
+    img.details = _set_golden_ref(img.details, golden.id)
     write_log(
         db,
         actor_id=user.id,
@@ -135,7 +201,36 @@ def add_to_golden_pool(
         target_id=golden.id,
     )
     db.commit()
-    return image_to_dict(golden)
+    return image_to_dict(img)
+
+
+@router.delete("/{image_id}/golden-pool")
+def remove_from_golden_pool(
+    image_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user.role.value != "admin":
+        raise HTTPException(403)
+    img = db.get(Image, image_id)
+    if not img or not img.job_id:
+        raise HTTPException(400)
+    golden_id = _parse_golden_ref(img.details)
+    if golden_id:
+        golden = db.get(Image, golden_id)
+        if golden and golden.is_golden and golden.job_id is None:
+            rel = golden.image_source
+            db.delete(golden)
+            try:
+                path = storage_path(rel)
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
+    img.is_golden = False
+    img.details = _set_golden_ref(img.details, None)
+    db.commit()
+    return image_to_dict(img)
 
 
 @router.post("/{image_id}/boxes")
@@ -151,10 +246,8 @@ def add_box(
     job = _assert_image_editable(db, user, img)
     if user.role not in (UserRole.annotator, UserRole.admin):
         raise HTTPException(403)
-    tags = list(img.tag or [])
-    if "Accept S1" in tags:
-        tags = [t for t in tags if t != "Accept S1"]
-        img.tag = tags
+    if _annotator_may_clear_accept(user, job):
+        _strip_accept_tags(img)
     box = Box(
         img_id=img.id,
         is_golden=img.is_golden,
@@ -200,11 +293,13 @@ def update_box(
         del data["status"]
     for k, v in data.items():
         if k == "tag":
-            box.tag = v
-            if user.role != UserRole.annotator:
-                box.status = BoxStatus(sync_box_status_from_tags(v or [], box.status.value))
+            # Copy list so ARRAY mutations don't leak across ORM instances
+            box.tag = list(v or [])
+            # Annotator clearing tags = marked fixed → Unseen; reviewer still syncs Rejected when tags present
+            box.status = BoxStatus(sync_box_status_from_tags(box.tag, box.status.value))
         elif hasattr(box, k if k != "class" else "class_"):
             setattr(box, k if k != "class" else "class_", v)
+    # Updating box fields must NOT clear Accept S1/All (only add/delete box or image caption)
     box.modifier_id = user.id
     if job:
         touch_job_lock(db, job, user.id)
@@ -230,12 +325,11 @@ def delete_box(
         raise HTTPException(404)
     img = box.image
     job = _assert_image_editable(db, user, img)
-    if user.role not in (UserRole.annotator, UserRole.admin):
+    # Annotator, reviewer (surplus box), and admin may delete boxes
+    if user.role not in (UserRole.annotator, UserRole.reviewer, UserRole.admin):
         raise HTTPException(403)
-    tags = list(img.tag or [])
-    if "Accept S1" in tags:
-        tags = [t for t in tags if t != "Accept S1"]
-        img.tag = tags
+    if _annotator_may_clear_accept(user, job):
+        _strip_accept_tags(img)
     db.delete(box)
     if job:
         touch_job_lock(db, job, user.id)
@@ -261,6 +355,8 @@ def remove_image_tag(
     if not img:
         raise HTTPException(404)
     _assert_image_editable(db, user, img)
+    if tag_name in _ACCEPT_TAGS and user.role == UserRole.annotator:
+        raise HTTPException(403, "Annotator cannot remove Accept S1 / Accept All")
     img.tag = [t for t in (img.tag or []) if t != tag_name]
     img.modifier_id = user.id
     db.commit()

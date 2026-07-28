@@ -48,49 +48,55 @@ export default function AdminDashboard() {
           + Task
         </button>
       </header>
-      <div className="dashboard-panel">
-        <div className="jobs-table-wrap">
-          <table className="jobs-table jobs-table-static">
-            <thead>
-              <tr>
-                <th>Task</th>
-                <th>Ngày tạo</th>
-                <th>Jobs</th>
-                <th>Ảnh</th>
-                <th>Tiến độ</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {tasks.map((t) => (
-                <tr key={t.id}>
-                  <td>{t.name}</td>
-                  <td>{formatCreated(t.created_at)}</td>
-                  <td>{t.job_num}</td>
-                  <td>{t.img_num}</td>
-                  <td>
-                    <div className="progress-inline">
-                      <span style={{ width: `${t.process}%` }} />
-                    </div>
-                    <small>
-                      {t.process}% · {t.completed_jobs}/{t.job_num} completed
-                    </small>
-                  </td>
-                  <td className="col-action">
-                    <button
-                      type="button"
-                      className="icon-btn-open"
-                      title="Mở task"
-                      onClick={() => nav(`/admin/tasks/${t.id}`)}
-                    >
-                      <IconFolderOpen />
-                    </button>
-                  </td>
+      <div className={`dashboard-panel ${tasks.length === 0 ? "dashboard-panel-fill" : ""}`}>
+        {tasks.length === 0 ? (
+          <div className="dashboard-empty">
+            <p>Chưa có task.</p>
+          </div>
+        ) : (
+          <div className="jobs-table-wrap">
+            <table className="jobs-table jobs-table-static">
+              <thead>
+                <tr>
+                  <th>Task</th>
+                  <th>Ngày tạo</th>
+                  <th>Jobs</th>
+                  <th>Ảnh</th>
+                  <th>Tiến độ</th>
+                  <th></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {tasks.map((t) => (
+                  <tr key={t.id}>
+                    <td>{t.name}</td>
+                    <td>{formatCreated(t.created_at)}</td>
+                    <td>{t.job_num}</td>
+                    <td>{t.img_num}</td>
+                    <td>
+                      <div className="progress-inline">
+                        <span style={{ width: `${t.process}%` }} />
+                      </div>
+                      <small>
+                        {t.process}% · {t.completed_jobs}/{t.job_num} completed
+                      </small>
+                    </td>
+                    <td className="col-action">
+                      <button
+                        type="button"
+                        className="icon-btn-open"
+                        title="Mở task"
+                        onClick={() => nav(`/admin/tasks/${t.id}`)}
+                      >
+                        <IconFolderOpen />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
       {showCreate && <CreateTaskModal onClose={() => setShowCreate(false)} onCreated={load} />}
     </>

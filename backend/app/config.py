@@ -1,3 +1,4 @@
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,7 +12,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg2://label_anything:label_anything_secret@localhost:5432/label_anything"
     secret_key: str = "dev-secret-key"
     storage_root: str = "/data/storage"
-    annotator_lock_timeout_minutes: int = 30
+    # Timeout (minutes) while user stays inside a job; leaving unlocks immediately.
+    job_lock_timeout_minutes: int = Field(
+        default=30,
+        validation_alias=AliasChoices("JOB_LOCK_TIMEOUT_MINUTES", "ANNOTATOR_LOCK_TIMEOUT_MINUTES"),
+    )
     access_token_expire_minutes: int = 60 * 24
 
 

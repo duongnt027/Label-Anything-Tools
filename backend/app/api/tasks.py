@@ -8,11 +8,25 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_roles
-from app.models import Image, Job, JobState, LogAction, LogTargetType, MinRoleToAddClass, Task, User, UserRole
-from app.schemas import ExportOptions, TaskCreate, TaskOut
+from app.models import (
+    Image,
+    Job,
+    JobState,
+    LogAction,
+    LogTargetType,
+    MinRoleToAddClass,
+    Task,
+    TaskAssignee,
+    User,
+    UserRole,
+)
+from app.schemas import ExportGoldenOptions, ExportOptions, TaskAssigneesIn, TaskCreate, TaskOut, UserOut
+from app.api.users import _user_out
 from app.services.tasks import (
+    copy_images_to_golden_pool,
     copy_images_to_task,
     ensure_storage,
+    export_golden_pool_json,
     export_task_json,
     import_task_json,
     materialize_uploads,
@@ -147,8 +161,9 @@ def add_class(
 
     if not can_add_class(user, task) and user.role != UserRole.admin:
         raise HTTPException(403)
-    if class_name not in (task.classes or []):
-        task.classes = list(task.classes or []) + [class_name]
+    existing = task.classes or []
+    if not any(c.lower() == class_name.lower() for c in existing):
+        task.classes = list(existing) + [class_name]
         write_log(
             db,
             actor_id=user.id,
@@ -165,22 +180,26 @@ def add_class(
 def remove_class(
     task_id: int,
     class_name: str,
-    user: User = Depends(require_roles("admin")),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    from app.models import Box, Job
+    from app.models import Box
+    from app.services.tasks import can_add_class
 
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(404)
-    task.classes = [c for c in (task.classes or []) if c != class_name]
-    job_ids = [j.id for j in db.query(Job).filter(Job.task_id == task_id).all()]
+    if user.role != UserRole.admin and not can_add_class(user, task):
+        raise HTTPException(403)
+    target = class_name.lower()
+    task.classes = [c for c in (task.classes or []) if c.lower() != target]
     imgs = db.query(Image).filter(Image.task_id == task_id).all()
     img_ids = [i.id for i in imgs]
     if img_ids:
-        db.query(Box).filter(Box.img_id.in_(img_ids), Box.class_ == class_name).delete(
-            synchronize_session=False
-        )
+        boxes = db.query(Box).filter(Box.img_id.in_(img_ids)).all()
+        for box in boxes:
+            if (box.class_ or "").lower() == target:
+                db.delete(box)
     write_log(
         db,
         actor_id=user.id,
@@ -190,7 +209,90 @@ def remove_class(
         detail=f"Removed class {class_name}",
     )
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "classes": task.classes}
+
+
+@router.get("/{task_id}/assignees", response_model=list[UserOut])
+def list_task_assignees(
+    task_id: int,
+    user: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    if not db.get(Task, task_id):
+        raise HTTPException(404)
+    rows = (
+        db.query(User)
+        .join(TaskAssignee, TaskAssignee.user_id == User.id)
+        .filter(TaskAssignee.task_id == task_id)
+        .order_by(User.username)
+        .all()
+    )
+    return [_user_out(db, u) for u in rows]
+
+
+@router.put("/{task_id}/assignees", response_model=list[UserOut])
+def set_task_assignees(
+    task_id: int,
+    body: TaskAssigneesIn,
+    admin: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    """Replace the assignee pool for a task. Users removed are unassigned from jobs."""
+    if not db.get(Task, task_id):
+        raise HTTPException(404)
+
+    wanted_ids = list(dict.fromkeys(body.user_ids))  # unique, keep order
+    if wanted_ids:
+        users = (
+            db.query(User)
+            .filter(
+                User.id.in_(wanted_ids),
+                User.role.in_([UserRole.annotator, UserRole.reviewer]),
+            )
+            .all()
+        )
+        found = {u.id for u in users}
+        missing = [i for i in wanted_ids if i not in found]
+        if missing:
+            raise HTTPException(400, "Chỉ thêm annotator/reviewer hợp lệ vào assignees")
+    else:
+        found = set()
+
+    existing = db.query(TaskAssignee).filter(TaskAssignee.task_id == task_id).all()
+    existing_ids = {r.user_id for r in existing}
+    to_remove = existing_ids - found
+    to_add = found - existing_ids
+
+    if to_remove:
+        # Clear job assignees who are no longer in the pool
+        jobs = (
+            db.query(Job)
+            .filter(Job.task_id == task_id, Job.assignee_id.in_(to_remove))
+            .all()
+        )
+        for job in jobs:
+            job.assignee_id = None
+            job.modifier_id = admin.id
+            if job.locked_by_id in to_remove:
+                job.locked_by_id = None
+                job.locked_at = None
+        db.query(TaskAssignee).filter(
+            TaskAssignee.task_id == task_id,
+            TaskAssignee.user_id.in_(to_remove),
+        ).delete(synchronize_session=False)
+
+    for uid in to_add:
+        db.add(TaskAssignee(task_id=task_id, user_id=uid))
+
+    db.commit()
+    rows = (
+        db.query(User)
+        .join(TaskAssignee, TaskAssignee.user_id == User.id)
+        .filter(TaskAssignee.task_id == task_id)
+        .order_by(User.username)
+        .all()
+    )
+    return [_user_out(db, u) for u in rows]
 
 
 @router.get("/{task_id}/golden-pool")
@@ -203,7 +305,96 @@ def golden_pool(task_id: int, user: User = Depends(require_roles("admin")), db: 
     )
     from app.services.tasks import image_to_dict
 
-    return [image_to_dict(i) for i in imgs]
+    result = []
+    for img in imgs:
+        item = image_to_dict(img)
+        boxes = list(img.boxes)
+        item["box_count"] = len(boxes)
+        item["class_count"] = len({(b.class_ or "").strip() for b in boxes if (b.class_ or "").strip()})
+        result.append(item)
+    return result
+
+
+@router.delete("/{task_id}/golden-pool/{image_id}")
+def delete_golden_image(
+    task_id: int,
+    image_id: int,
+    user: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    img = db.get(Image, image_id)
+    if not img or img.task_id != task_id or not img.is_golden or img.job_id is not None:
+        raise HTTPException(404, "Golden image không tồn tại")
+    rel = img.image_source
+    db.delete(img)
+    db.commit()
+    try:
+        path = storage_path(rel)
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+    return {"ok": True}
+
+
+@router.post("/{task_id}/golden-pool/export")
+def export_golden_pool(
+    task_id: int,
+    opts: ExportGoldenOptions,
+    user: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    if not db.get(Task, task_id):
+        raise HTTPException(404)
+    return export_golden_pool_json(
+        db,
+        task_id,
+        box_visibility=opts.box_visibility,
+        include_images=opts.include_images,
+        image_ids=opts.image_ids,
+    )
+
+
+@router.post("/{task_id}/golden-pool/import")
+async def import_golden_pool(
+    task_id: int,
+    server_folder: str | None = Form(None),
+    files: list[UploadFile] = File(default=[]),
+    user: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404)
+    ensure_storage()
+    sources: list[tuple[str, str]] = []
+    if server_folder and server_folder.strip():
+        folder = Path(server_folder.strip())
+        if not folder.is_dir():
+            folder = storage_path(server_folder.strip())
+        if not folder.is_dir():
+            raise HTTPException(400, "Thư mục mount không tồn tại")
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp", "*.gif"):
+            for p in sorted(folder.glob(ext)):
+                sources.append((str(p), p.name))
+    if files:
+        try:
+            sources.extend(await materialize_uploads(files, user.id))
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "File ZIP không hợp lệ")
+    if not sources:
+        raise HTTPException(400, "Chọn mount folder hoặc upload ZIP")
+    count = copy_images_to_golden_pool(db, task, sources, user.id)
+    write_log(
+        db,
+        actor_id=user.id,
+        action=LogAction.add_to_golden_pool,
+        target_type=LogTargetType.task,
+        target_id=task.id,
+        detail=f"Imported {count} golden images",
+    )
+    db.commit()
+    return {"imported": count}
 
 
 @router.post("/{task_id}/export")
@@ -215,7 +406,14 @@ def export_task(
 ):
     if not db.get(Task, task_id):
         raise HTTPException(404)
-    return export_task_json(db, task_id, opts.include_rejected, opts.job_ids)
+    return export_task_json(
+        db,
+        task_id,
+        box_visibility=opts.box_visibility,
+        include_images=opts.include_images,
+        include_rejected=opts.include_rejected,
+        job_ids=opts.job_ids,
+    )
 
 
 @router.post("/{task_id}/import")

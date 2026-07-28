@@ -77,6 +77,8 @@ export type User = {
 export type Job = {
   id: number;
   task_id: number;
+  /** 1-based job number within the task (display ID). */
+  task_job_id: number;
   state: string;
   img_num: number;
   annotator_process: number;
@@ -92,6 +94,8 @@ export type Job = {
 
 export type LaImage = {
   id: number;
+  task_id?: number;
+  job_id?: number | null;
   image_source: string;
   filename?: string;
   order_index: number | null;
@@ -100,6 +104,8 @@ export type LaImage = {
   caption: string | null;
   details: string | null;
   is_golden?: boolean;
+  box_count?: number;
+  class_count?: number;
 };
 
 export type Box = {
@@ -110,6 +116,7 @@ export type Box = {
   segment_points: string;
   ocr_text: string;
   caption: string;
+  details?: string;
   tag: string[];
   status: string;
 };

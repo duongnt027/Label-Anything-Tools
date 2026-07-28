@@ -58,6 +58,7 @@ class TaskOut(BaseModel):
 class JobOut(BaseModel):
     id: int
     task_id: int
+    task_job_id: int
     state: str
     img_num: int
     annotator_process: int
@@ -74,6 +75,18 @@ class JobOut(BaseModel):
 
 class AssignJobIn(BaseModel):
     assignee_id: int
+
+
+class JobStateIn(BaseModel):
+    state: str
+
+
+class AutoAssignIn(BaseModel):
+    assignee_ids: list[int] | None = None
+
+
+class TaskAssigneesIn(BaseModel):
+    user_ids: list[int]
 
 
 class BoxIn(BaseModel):
@@ -107,5 +120,15 @@ class ImageUpdate(BaseModel):
 
 
 class ExportOptions(BaseModel):
-    include_rejected: bool = True
+    include_images: bool = False
+    # all | visible | invisible
+    box_visibility: str = "all"
+    # legacy alias kept for older clients
+    include_rejected: bool | None = None
     job_ids: list[int] | None = None
+
+
+class ExportGoldenOptions(BaseModel):
+    include_images: bool = False
+    box_visibility: str = "all"
+    image_ids: list[int] | None = None

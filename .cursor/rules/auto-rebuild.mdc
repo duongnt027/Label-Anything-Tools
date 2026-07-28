@@ -1,0 +1,19 @@
+---
+description: After finishing code changes, always rebuild Docker services
+alwaysApply: true
+---
+
+# Auto rebuild after work
+
+Whenever you finish a task that changed backend or frontend code (or Docker-related config), before ending the turn run:
+
+```bash
+docker compose up -d --build
+```
+
+from the repo root `D:\Works\XIX\label_anything`.
+
+- Do this automatically; do not only remind the user to rebuild.
+- Skip only for pure docs/rules/comments with no runtime effect, or if the user explicitly says not to rebuild.
+- Prefer `required_permissions: ["all"]` (or equivalent) so Docker can run.
+- Briefly mention that rebuild was started/finished in the final reply.

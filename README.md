@@ -69,7 +69,7 @@ npm run dev
 | `DATABASE_URL` | SQLAlchemy URL |
 | `SECRET_KEY` | JWT |
 | `STORAGE_ROOT` | Volume ảnh (path DB là relative) |
-| `ANNOTATOR_LOCK_TIMEOUT_MINUTES` | Timeout lock annotator (30) |
+| `JOB_LOCK_TIMEOUT_MINUTES` | Idle timeout (minutes) while inside a job before auto-unlock; leaving unlocks immediately (30) |
 | `TZ` | Asia/Ho_Chi_Minh |
 
 Spec chi tiết: `component.md`, `ui.md`.

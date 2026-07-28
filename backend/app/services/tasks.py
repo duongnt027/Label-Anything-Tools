@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -16,8 +17,8 @@ from app.services.jobs import count_job_images, task_stats, touch_job_lock, writ
 from app.services.status import derive_image_status
 
 
-def storage_path(*parts: str) -> Path:
-    return Path(settings.storage_root).joinpath(*parts)
+def storage_path(*parts: str | int | Path) -> Path:
+    return Path(settings.storage_root).joinpath(*(str(p) for p in parts))
 
 
 def ensure_storage() -> None:
@@ -125,6 +126,38 @@ def copy_images_to_task(
             )
 
 
+def copy_images_to_golden_pool(
+    db: Session,
+    task: Task,
+    sources: list[tuple[str, str]],
+    modifier_id: int,
+) -> int:
+    """Copy source images into the task golden pool (job_id=None, is_golden=True)."""
+    ensure_storage()
+    golden_dir = storage_path("tasks", str(task.id), "golden")
+    golden_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for src, original_name in sources:
+        src_path = Path(src)
+        if not src_path.is_file():
+            continue
+        stored_name = _unique_name(golden_dir, original_name)
+        rel = f"tasks/{task.id}/golden/{stored_name}"
+        dest = storage_path(rel)
+        shutil.copy2(src_path, dest)
+        db.add(
+            Image(
+                task_id=task.id,
+                job_id=None,
+                is_golden=True,
+                image_source=rel,
+                modifier_id=modifier_id,
+            )
+        )
+        count += 1
+    return count
+
+
 def inject_golden_images(db: Session, job: Job, modifier_id: int) -> None:
     if job.golden_injected:
         return
@@ -148,7 +181,7 @@ def inject_golden_images(db: Session, job: Job, modifier_id: int) -> None:
     for idx, golden in enumerate(selected):
         rel = golden.image_source
         src = storage_path(rel)
-        job_dir = storage_path("tasks", task.id, "jobs", job.id)
+        job_dir = storage_path("tasks", str(task.id), "jobs", str(job.id))
         job_dir.mkdir(parents=True, exist_ok=True)
         stored_name = _unique_name(job_dir, Path(rel).name)
         new_rel = f"tasks/{task.id}/jobs/{job.id}/{stored_name}"
@@ -195,8 +228,21 @@ def inject_golden_images(db: Session, job: Job, modifier_id: int) -> None:
 
 
 def export_task_json(
-    db: Session, task_id: int, include_rejected: bool, job_ids: list[int] | None = None
+    db: Session,
+    task_id: int,
+    *,
+    box_visibility: str = "all",
+    include_images: bool = False,
+    include_rejected: bool | None = None,
+    job_ids: list[int] | None = None,
 ) -> list[dict]:
+    # Backward compat: include_rejected=False ≈ visible only; True ≈ all
+    visibility = (box_visibility or "all").lower()
+    if include_rejected is not None and box_visibility == "all":
+        visibility = "all" if include_rejected else "visible"
+    if visibility not in ("all", "visible", "invisible"):
+        visibility = "all"
+
     q = db.query(Image).filter(Image.task_id == task_id, Image.job_id.isnot(None))
     if job_ids:
         q = q.filter(Image.job_id.in_(job_ids))
@@ -206,7 +252,9 @@ def export_task_json(
         bboxes = []
         for box in img.boxes:
             visible = box.status.value != "Rejected"
-            if not include_rejected and not visible:
+            if visibility == "visible" and not visible:
+                continue
+            if visibility == "invisible" and visible:
                 continue
             parts = box.box_points.split()
             x, y, w, h = (float(p) for p in (parts + ["0", "0", "0", "0"])[:4])
@@ -227,14 +275,82 @@ def export_task_json(
                     "visible": visible,
                 }
             )
-        result.append(
-            {
-                "id": img.id,
-                "path": str(storage_path(img.image_source)),
-                "caption": img.caption,
-                "bboxes": bboxes,
-            }
-        )
+        entry: dict = {
+            "id": img.id,
+            "path": str(storage_path(img.image_source)),
+            "caption": img.caption,
+            "bboxes": bboxes,
+        }
+        if include_images:
+            src = storage_path(img.image_source)
+            if src.is_file():
+                entry["image_base64"] = base64.b64encode(src.read_bytes()).decode("ascii")
+                entry["image_filename"] = Path(img.image_source).name
+        result.append(entry)
+    return result
+
+
+def export_golden_pool_json(
+    db: Session,
+    task_id: int,
+    *,
+    box_visibility: str = "all",
+    include_images: bool = False,
+    image_ids: list[int] | None = None,
+) -> list[dict]:
+    visibility = (box_visibility or "all").lower()
+    if visibility not in ("all", "visible", "invisible"):
+        visibility = "all"
+
+    q = db.query(Image).filter(
+        Image.task_id == task_id,
+        Image.job_id.is_(None),
+        Image.is_golden.is_(True),
+    )
+    if image_ids:
+        q = q.filter(Image.id.in_(image_ids))
+    images = q.order_by(Image.id).all()
+    result = []
+    for img in images:
+        bboxes = []
+        for box in img.boxes:
+            visible = box.status.value != "Rejected"
+            if visibility == "visible" and not visible:
+                continue
+            if visibility == "invisible" and visible:
+                continue
+            parts = box.box_points.split()
+            x, y, w, h = (float(p) for p in (parts + ["0", "0", "0", "0"])[:4])
+            seg = []
+            if box.segment_points.strip():
+                seg = [float(v) for v in box.segment_points.split()]
+            bboxes.append(
+                {
+                    "id": box.id,
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "caption": box.caption,
+                    "ocr": box.ocr_text,
+                    "class": box.class_,
+                    "segment": seg,
+                    "visible": visible,
+                }
+            )
+        entry: dict = {
+            "id": img.id,
+            "path": str(storage_path(img.image_source)),
+            "caption": img.caption,
+            "bboxes": bboxes,
+            "is_golden": True,
+        }
+        if include_images:
+            src = storage_path(img.image_source)
+            if src.is_file():
+                entry["image_base64"] = base64.b64encode(src.read_bytes()).decode("ascii")
+                entry["image_filename"] = Path(img.image_source).name
+        result.append(entry)
     return result
 
 
@@ -282,7 +398,7 @@ def image_to_dict(img: Image) -> dict:
         "image_source": img.image_source,
         "filename": Path(img.image_source).name,
         "order_index": img.order_index,
-        "tag": img.tag,
+        "tag": list(img.tag or []),
         "status": derive_image_status(img.tag or []),
         "caption": img.caption,
         "details": img.details,
@@ -294,7 +410,7 @@ def box_to_dict(box: Box) -> dict:
         "id": box.id,
         "img_id": box.img_id,
         "is_golden": box.is_golden,
-        "tag": box.tag,
+        "tag": list(box.tag or []),
         "status": box.status.value,
         "class": box.class_,
         "box_points": box.box_points,

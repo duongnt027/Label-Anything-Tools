@@ -16,9 +16,11 @@ export default function AnnotatorDashboard() {
       <header className="topbar topbar-plain">
         <span className="topbar-title">Jobs được giao</span>
       </header>
-      <div className="dashboard-panel">
+      <div className={`dashboard-panel ${jobs.length === 0 ? "dashboard-panel-fill" : ""}`}>
         {jobs.length === 0 ? (
-          <p style={{ color: "var(--text-muted)" }}>Chưa có job — liên hệ admin để được assign.</p>
+          <div className="dashboard-empty">
+            <p>Chưa có job.</p>
+          </div>
         ) : (
           <div className="jobs-table-wrap">
             <table className="jobs-table jobs-table-static">
@@ -34,7 +36,7 @@ export default function AnnotatorDashboard() {
               <tbody>
                 {jobs.map((j) => (
                   <tr key={j.id}>
-                    <td>#{j.id}</td>
+                    <td>#{j.task_job_id}</td>
                     <td>{j.img_num}</td>
                     <td>
                       <div className="progress-inline">

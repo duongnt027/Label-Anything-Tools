@@ -11,12 +11,31 @@ from app.services.jobs import write_log
 router = APIRouter(prefix="/api/users", tags=["users"])
 
 
-def _resolve_supervisor_id(db: Session, username: str | None) -> int | None:
+ROLE_RANK = {"admin": 3, "reviewer": 2, "annotator": 1}
+
+
+def _resolve_supervisor_id(
+    db: Session,
+    username: str | None,
+    *,
+    subordinate_role: UserRole,
+    subordinate_username: str | None = None,
+) -> int | None:
     if username is None or not str(username).strip():
         return None
     sup = db.query(User).filter(User.username == username.strip()).first()
     if not sup:
         raise HTTPException(400, f"Không tìm thấy supervisor '{username}'")
+    if subordinate_username and sup.username == subordinate_username:
+        raise HTTPException(400, "Không thể tự làm supervisor của chính mình")
+    sub_rank = ROLE_RANK.get(subordinate_role.value, 0)
+    sup_rank = ROLE_RANK.get(sup.role.value, 0)
+    # Admin may only have another admin (or none). Others need a strictly higher role.
+    if subordinate_role == UserRole.admin:
+        if sup.role != UserRole.admin:
+            raise HTTPException(400, "Admin chỉ có thể có supervisor là admin khác")
+    elif sup_rank <= sub_rank:
+        raise HTTPException(400, "Supervisor phải có role cao hơn user hiện tại")
     return sup.id
 
 
@@ -58,7 +77,12 @@ def create_user(
         username=body.username,
         password=hash_password(body.password),
         role=role,
-        supervisor_id=_resolve_supervisor_id(db, body.supervisor_username),
+        supervisor_id=_resolve_supervisor_id(
+            db,
+            body.supervisor_username,
+            subordinate_role=role,
+            subordinate_username=body.username,
+        ),
     )
     db.add(user)
     db.flush()
@@ -93,7 +117,25 @@ def update_user(
         user.role = UserRole(body.role)
     data = body.model_dump(exclude_unset=True)
     if "supervisor_username" in data:
-        user.supervisor_id = _resolve_supervisor_id(db, body.supervisor_username)
+        user.supervisor_id = _resolve_supervisor_id(
+            db,
+            body.supervisor_username,
+            subordinate_role=user.role,
+            subordinate_username=user.username,
+        )
+    elif body.role is not None and user.supervisor_id:
+        # Role changed: drop supervisor if no longer valid.
+        sup = db.get(User, user.supervisor_id)
+        if sup:
+            try:
+                _resolve_supervisor_id(
+                    db,
+                    sup.username,
+                    subordinate_role=user.role,
+                    subordinate_username=user.username,
+                )
+            except HTTPException:
+                user.supervisor_id = None
     db.commit()
     db.refresh(user)
     return _user_out(db, user)

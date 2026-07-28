@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, Job, LaImage, User } from "../api";
+import { AssigneeCombobox } from "../components/AssigneeCombobox";
+import { AssigneesModal } from "../components/AssigneesModal";
+import { ExportOptions, ExportOptionsModal } from "../components/ExportOptionsModal";
+import { ImportGoldenModal } from "../components/ImportGoldenModal";
+import { ImportTaskModal } from "../components/ImportTaskModal";
 import { IconExport, IconFolderOpen } from "../components/icons";
 
 function formatDateTime(iso: string | undefined) {
@@ -27,42 +32,54 @@ function downloadJson(data: unknown, filename: string) {
   URL.revokeObjectURL(a.href);
 }
 
-const JOB_STAGE_TABS: [string, string][] = [
-  ["annotator", "Annotator"],
-  ["review_s1", "Reviewer S1"],
-  ["review_s2", "Reviewer S2"],
-];
+type ExportTarget =
+  | { kind: "task" }
+  | { kind: "selected" }
+  | { kind: "job"; jobId: number; taskJobId: number }
+  | { kind: "golden" };
 
 export default function TaskDetailPage() {
   const { taskId } = useParams();
+  const [search] = useSearchParams();
   const nav = useNavigate();
-  const [screenTab, setScreenTab] = useState<"golden" | "jobs">("jobs");
-  const [golden, setGolden] = useState<LaImage[]>([]);
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [annotators, setAnnotators] = useState<User[]>([]);
-  const [jobTab, setJobTab] = useState("annotator");
-  const [assignDraft, setAssignDraft] = useState<Record<number, number>>({});
-  const [selectedJobIds, setSelectedJobIds] = useState<Set<number>>(new Set());
-
-  const loadJobs = () => api<Job[]>(`/api/jobs/by-task/${taskId}?tab=${jobTab}`).then(setJobs);
+  const tabParam = search.get("tab");
+  const [screenTab, setScreenTab] = useState<"golden" | "jobs">(
+    tabParam === "golden" ? "golden" : "jobs",
+  );
 
   useEffect(() => {
-    api<LaImage[]>(`/api/tasks/${taskId}/golden-pool`).then(setGolden);
-    api<User[]>("/api/users")
-      .then((u) => setAnnotators(u.filter((x) => x.role === "annotator")))
-      .catch(() => {});
+    if (tabParam === "golden" || tabParam === "jobs") setScreenTab(tabParam);
+  }, [tabParam]);
+  const [golden, setGolden] = useState<LaImage[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [assignees, setAssignees] = useState<User[]>([]);
+  const [selectedJobIds, setSelectedJobIds] = useState<Set<number>>(new Set());
+  const [selectedGoldenIds, setSelectedGoldenIds] = useState<Set<number>>(new Set());
+  const [importGoldenOpen, setImportGoldenOpen] = useState(false);
+  const [importTaskOpen, setImportTaskOpen] = useState(false);
+  const [assigneesOpen, setAssigneesOpen] = useState(false);
+  const [exportTarget, setExportTarget] = useState<ExportTarget | null>(null);
+  const [pageSize, setPageSize] = useState(20);
+
+  const loadGolden = () => api<LaImage[]>(`/api/tasks/${taskId}/golden-pool`).then(setGolden);
+  const loadJobs = () => api<Job[]>(`/api/jobs/by-task/${taskId}?tab=all`).then(setJobs);
+  const loadAssignees = () => api<User[]>(`/api/tasks/${taskId}/assignees`).then(setAssignees);
+
+  useEffect(() => {
+    loadGolden().catch(console.error);
+    loadAssignees().catch(console.error);
+    loadJobs().catch(console.error);
   }, [taskId]);
 
   useEffect(() => {
-    loadJobs().catch(console.error);
-  }, [taskId, jobTab]);
-
-  useEffect(() => {
     setSelectedJobIds(new Set());
-  }, [jobTab, taskId]);
+    setSelectedGoldenIds(new Set());
+  }, [taskId]);
 
   const allSelected = jobs.length > 0 && jobs.every((j) => selectedJobIds.has(j.id));
   const someSelected = jobs.some((j) => selectedJobIds.has(j.id));
+  const allGoldenSelected = golden.length > 0 && golden.every((g) => selectedGoldenIds.has(g.id));
+  const someGoldenSelected = golden.some((g) => selectedGoldenIds.has(g.id));
 
   const toggleAllJobs = () => {
     if (allSelected) setSelectedJobIds(new Set());
@@ -78,41 +95,59 @@ export default function TaskDetailPage() {
     });
   };
 
-  const exportWithJobIds = async (jobIds: number[] | null, filename: string) => {
-    const body: { include_rejected: boolean; job_ids?: number[] } = { include_rejected: true };
-    if (jobIds && jobIds.length) body.job_ids = jobIds;
+  const toggleAllGolden = () => {
+    if (allGoldenSelected) setSelectedGoldenIds(new Set());
+    else setSelectedGoldenIds(new Set(golden.map((g) => g.id)));
+  };
+
+  const toggleGolden = (id: number) => {
+    setSelectedGoldenIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const runExport = async (target: ExportTarget, opts: ExportOptions) => {
+    if (target.kind === "golden") {
+      const ids = [...selectedGoldenIds];
+      if (!ids.length) throw new Error("Chọn ít nhất một ảnh");
+      const data = await api(`/api/tasks/${taskId}/golden-pool/export`, {
+        method: "POST",
+        body: JSON.stringify({
+          include_images: opts.includeImages,
+          box_visibility: opts.boxVisibility,
+          image_ids: ids,
+        }),
+      });
+      downloadJson(data, `task-${taskId}-golden-pool.json`);
+      return;
+    }
+
+    const body: {
+      include_images: boolean;
+      box_visibility: string;
+      job_ids?: number[];
+    } = {
+      include_images: opts.includeImages,
+      box_visibility: opts.boxVisibility,
+    };
+    let filename = `task-${taskId}-export.json`;
+    if (target.kind === "selected") {
+      const ids = [...selectedJobIds];
+      if (!ids.length) throw new Error("Chọn ít nhất một job");
+      body.job_ids = ids;
+      filename = `task-${taskId}-jobs-selected.json`;
+    } else if (target.kind === "job") {
+      body.job_ids = [target.jobId];
+      filename = `task-${taskId}-job-${target.taskJobId}.json`;
+    }
     const data = await api(`/api/tasks/${taskId}/export`, {
       method: "POST",
       body: JSON.stringify(body),
     });
     downloadJson(data, filename);
-  };
-
-  const exportWholeTask = () => exportWithJobIds(null, `task-${taskId}-export.json`);
-
-  const exportSelectedJobs = () => {
-    const ids = [...selectedJobIds];
-    if (!ids.length) {
-      alert("Chọn ít nhất một job");
-      return;
-    }
-    exportWithJobIds(ids, `task-${taskId}-jobs-${ids.join("-")}.json`);
-  };
-
-  const exportOneJob = (jobId: number) => {
-    exportWithJobIds([jobId], `task-${taskId}-job-${jobId}.json`);
-  };
-
-  const importJson = async (file: File) => {
-    const fd = new FormData();
-    fd.append("file", file);
-    await fetch(`/api/tasks/${taskId}/import`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${localStorage.getItem("la_token")}` },
-      body: fd,
-    });
-    alert("Import xong");
-    loadJobs();
   };
 
   const deleteTask = async () => {
@@ -121,23 +156,79 @@ export default function TaskDetailPage() {
     nav("/admin");
   };
 
-  const assignJob = async (jobId: number) => {
-    const assigneeId = assignDraft[jobId];
+  const assignJob = async (jobId: number, assigneeId: number) => {
     if (!assigneeId) return;
-    await api(`/api/jobs/${jobId}/assign`, {
-      method: "POST",
-      body: JSON.stringify({ assignee_id: assigneeId }),
-    });
-    await loadJobs();
+    try {
+      await api(`/api/jobs/${jobId}/assign`, {
+        method: "POST",
+        body: JSON.stringify({ assignee_id: assigneeId }),
+      });
+      await loadJobs();
+    } catch (ex) {
+      alert(ex instanceof Error ? ex.message : "Assign thất bại");
+    }
+  };
+
+  const unassignJob = async (jobId: number) => {
+    try {
+      await api(`/api/jobs/${jobId}/unassign`, { method: "POST" });
+      await loadJobs();
+    } catch (ex) {
+      alert(ex instanceof Error ? ex.message : "Unassign thất bại");
+    }
+  };
+
+  const JOB_STATES = ["new", "in_progress", "need_review", "completed", "rejected"] as const;
+
+  const changeJobState = async (jobId: number, state: string) => {
+    try {
+      await api(`/api/jobs/${jobId}/state`, {
+        method: "PATCH",
+        body: JSON.stringify({ state }),
+      });
+      await loadJobs();
+    } catch (ex) {
+      alert(ex instanceof Error ? ex.message : "Đổi state thất bại");
+    }
+  };
+
+  const deleteGolden = async (imageId: number, name: string) => {
+    if (!confirm(`Xóa ảnh golden "${name}"?`)) return;
+    try {
+      await api(`/api/tasks/${taskId}/golden-pool/${imageId}`, { method: "DELETE" });
+      setSelectedGoldenIds((prev) => {
+        const next = new Set(prev);
+        next.delete(imageId);
+        return next;
+      });
+      await loadGolden();
+    } catch (ex) {
+      alert(ex instanceof Error ? ex.message : "Xóa thất bại");
+    }
   };
 
   const openJob = (j: Job) => {
-    if (jobTab === "review_s2") nav(`/jobs/${j.id}/review-s2`);
-    else if (jobTab === "review_s1") nav(`/jobs/${j.id}?mode=review&view_as=reviewer`);
-    else nav(`/jobs/${j.id}?view_as=annotator`);
+    if (j.state === "need_review" && j.review_stage === 2) {
+      nav(`/jobs/${j.id}/review-s2?view_as=reviewer&admin_view=s2`);
+    } else if (j.state === "need_review") {
+      nav(`/jobs/${j.id}?mode=review&view_as=reviewer&admin_view=s1`);
+    } else {
+      nav(`/jobs/${j.id}?view_as=annotator&admin_view=annotator`);
+    }
   };
 
   const goldenEmpty = golden.length === 0;
+
+  const exportTitle =
+    exportTarget?.kind === "task"
+      ? "Export task"
+      : exportTarget?.kind === "selected"
+        ? "Export đã chọn"
+        : exportTarget?.kind === "job"
+          ? `Export job #${exportTarget.taskJobId}`
+          : exportTarget?.kind === "golden"
+            ? "Export pool"
+            : "Export";
 
   return (
     <div className="task-detail-page">
@@ -146,21 +237,14 @@ export default function TaskDetailPage() {
           ← Task dashboard
         </button>
         <div className="task-detail-toolbar-right">
-          <button
-            type="button"
-            className="task-action-btn task-action-import"
-            onClick={() => document.getElementById("task-import-file")?.click()}
-          >
+          <button type="button" className="task-action-btn task-action-import" onClick={() => setImportTaskOpen(true)}>
             Import
           </button>
-          <input
-            id="task-import-file"
-            type="file"
-            accept="application/json"
-            hidden
-            onChange={(e) => e.target.files?.[0] && importJson(e.target.files[0])}
-          />
-          <button type="button" className="task-action-btn task-action-export" onClick={exportWholeTask}>
+          <button
+            type="button"
+            className="task-action-btn task-action-export"
+            onClick={() => setExportTarget({ kind: "task" })}
+          >
             Export
           </button>
           <button type="button" className="task-action-btn task-action-delete" onClick={deleteTask}>
@@ -173,148 +257,310 @@ export default function TaskDetailPage() {
         <button
           type="button"
           className={`task-screen-tab ${screenTab === "golden" ? "active" : ""}`}
-          onClick={() => setScreenTab("golden")}
+          onClick={() => {
+            setScreenTab("golden");
+            nav(`/admin/tasks/${taskId}?tab=golden`, { replace: true });
+          }}
         >
           Golden pool
         </button>
         <button
           type="button"
           className={`task-screen-tab ${screenTab === "jobs" ? "active" : ""}`}
-          onClick={() => setScreenTab("jobs")}
+          onClick={() => {
+            setScreenTab("jobs");
+            nav(`/admin/tasks/${taskId}?tab=jobs`, { replace: true });
+          }}
         >
           Jobs
         </button>
       </div>
 
       {screenTab === "golden" ? (
-        <div className="dashboard-panel">
+        <div className={`dashboard-panel ${goldenEmpty ? "dashboard-panel-fill" : ""}`}>
           {goldenEmpty ? (
-            <p className="task-empty-hint">Chưa có ảnh golden trong pool.</p>
-          ) : (
-            <div className="golden-pool-grid">
-              {golden.map((g) => (
-                <button key={g.id} type="button" className="golden-pool-item" onClick={() => nav(`/golden/${g.id}`)}>
-                  {g.filename || `#${g.id}`}
-                </button>
-              ))}
+            <div className="golden-empty-center">
+              <button
+                type="button"
+                className="golden-import-cta"
+                onClick={() => setImportGoldenOpen(true)}
+              >
+                <span className="golden-import-cta-plus" aria-hidden>
+                  +
+                </span>
+                Import
+              </button>
             </div>
+          ) : (
+            <>
+              <div className="jobs-bulk-bar">
+                <label className="jobs-bulk-check">
+                  <input
+                    type="checkbox"
+                    className="jobs-tick"
+                    checked={allGoldenSelected}
+                    ref={(el) => {
+                      if (el) el.indeterminate = someGoldenSelected && !allGoldenSelected;
+                    }}
+                    onChange={toggleAllGolden}
+                  />
+                  <span className="jobs-bulk-check-label">Chọn ảnh</span>
+                </label>
+                <div className="jobs-bulk-actions">
+                  <button
+                    type="button"
+                    className="golden-import-cta golden-import-cta-sm"
+                    onClick={() => setImportGoldenOpen(true)}
+                  >
+                    <span className="golden-import-cta-plus" aria-hidden>
+                      +
+                    </span>
+                    Import
+                  </button>
+                  <button
+                    type="button"
+                    className="task-action-btn task-action-export task-action-export-sm"
+                    disabled={selectedGoldenIds.size === 0}
+                    onClick={() => setExportTarget({ kind: "golden" })}
+                  >
+                    Export pool ({selectedGoldenIds.size})
+                  </button>
+                </div>
+              </div>
+              <div className="jobs-table-wrap">
+                <table className="jobs-table jobs-table-task golden-pool-table">
+                  <thead>
+                    <tr>
+                      <th className="col-check" />
+                      <th>Tên ảnh</th>
+                      <th>Boxes</th>
+                      <th>Classes</th>
+                      <th className="col-actions">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {golden.map((g) => {
+                      const name = g.filename || `#${g.id}`;
+                      return (
+                        <tr key={g.id}>
+                          <td className="col-check">
+                            <input
+                              type="checkbox"
+                              className="jobs-tick"
+                              checked={selectedGoldenIds.has(g.id)}
+                              onChange={() => toggleGolden(g.id)}
+                              aria-label={`Chọn ${name}`}
+                            />
+                          </td>
+                          <td className="golden-name-cell" title={name}>
+                            {name}
+                          </td>
+                          <td>{g.box_count ?? 0}</td>
+                          <td>{g.class_count ?? 0}</td>
+                          <td className="col-actions">
+                            <button
+                              type="button"
+                              className="icon-btn-open"
+                              title="Mở ảnh"
+                              onClick={() => nav(`/golden/${g.id}`)}
+                            >
+                              <IconFolderOpen />
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-x btn-x-lg"
+                              title="Xóa ảnh"
+                              onClick={() => deleteGolden(g.id, name)}
+                            >
+                              ×
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
           )}
         </div>
       ) : (
-        <div className="dashboard-panel">
-          <div className="job-stage-tabs">
-            {JOB_STAGE_TABS.map(([k, label]) => (
-              <button
-                key={k}
-                type="button"
-                className={`job-stage-tab ${jobTab === k ? "active" : ""}`}
-                onClick={() => setJobTab(k)}
+        <div className={`dashboard-panel ${jobs.length === 0 ? "dashboard-panel-fill" : ""}`}>
+          {jobs.length === 0 ? (
+            <div className="dashboard-empty">
+              <p>Chưa có job.</p>
+            </div>
+          ) : (
+            <>
+              <div className="jobs-bulk-bar">
+                <label className="jobs-bulk-check">
+                  <input
+                    type="checkbox"
+                    className="jobs-tick"
+                    checked={allSelected}
+                    ref={(el) => {
+                      if (el) el.indeterminate = someSelected && !allSelected;
+                    }}
+                    onChange={toggleAllJobs}
+                  />
+                  <span className="jobs-bulk-check-label">Chọn job</span>
+                </label>
+                <div className="jobs-bulk-actions">
+                  <label className="jobs-page-size">
+                    <span>List view</span>
+                    <select
+                      value={pageSize}
+                      onChange={(e) => setPageSize(Number(e.target.value))}
+                      aria-label="Số job tối đa hiển thị"
+                    >
+                      <option value={10}>10</option>
+                      <option value={20}>20</option>
+                      <option value={50}>50</option>
+                      <option value={100}>100</option>
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="task-action-btn task-action-assignees"
+                    onClick={() => setAssigneesOpen(true)}
+                  >
+                    Assignees
+                  </button>
+                  <button
+                    type="button"
+                    className="task-action-btn task-action-export task-action-export-sm"
+                    disabled={selectedJobIds.size === 0}
+                    onClick={() => setExportTarget({ kind: "selected" })}
+                  >
+                    Export đã chọn ({selectedJobIds.size})
+                  </button>
+                </div>
+              </div>
+
+              <div
+                className="jobs-table-wrap jobs-table-scroll"
+                style={{ maxHeight: `calc(${pageSize} * 2.75rem + 2.75rem)` }}
               >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          <div className="jobs-bulk-bar">
-            <label className="jobs-bulk-check">
-              <input
-                type="checkbox"
-                checked={allSelected}
-                ref={(el) => {
-                  if (el) el.indeterminate = someSelected && !allSelected;
-                }}
-                onChange={toggleAllJobs}
-              />
-              <span>Chọn job</span>
-            </label>
-            <button
-              type="button"
-              className="task-action-btn task-action-export task-action-export-sm"
-              disabled={selectedJobIds.size === 0}
-              onClick={exportSelectedJobs}
-            >
-              Export đã chọn ({selectedJobIds.size})
-            </button>
-          </div>
-
-          <div className="jobs-table-wrap">
-            <table className="jobs-table jobs-table-task">
-              <thead>
-                <tr>
-                  <th className="col-check" />
-                  <th>ID</th>
-                  <th>Cập nhật</th>
-                  <th>Ảnh</th>
-                  <th>Assignee</th>
-                  <th>Lock by</th>
-                  <th>State</th>
-                  <th className="col-actions">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {jobs.map((j) => (
-                  <tr key={j.id}>
-                    <td className="col-check">
-                      <input
-                        type="checkbox"
-                        checked={selectedJobIds.has(j.id)}
-                        onChange={() => toggleJob(j.id)}
-                        aria-label={`Chọn job ${j.id}`}
-                      />
-                    </td>
-                    <td>#{j.id}</td>
-                    <td>{formatDateTime(j.updated_at)}</td>
-                    <td>{j.img_num}</td>
-                    <td className="col-assignee">
-                      {j.assignee_username ? (
-                        j.assignee_username
-                      ) : jobTab === "annotator" ? (
-                        <div className="assign-inline">
+                <table className="jobs-table jobs-table-task">
+                  <thead>
+                    <tr>
+                      <th className="col-check" />
+                      <th>ID</th>
+                      <th>Cập nhật</th>
+                      <th>Ảnh</th>
+                      <th>Assignee</th>
+                      <th>Lock by</th>
+                      <th>State</th>
+                      <th className="col-actions">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {jobs.map((j) => (
+                      <tr key={j.id}>
+                        <td className="col-check">
+                          <input
+                            type="checkbox"
+                            className="jobs-tick"
+                            checked={selectedJobIds.has(j.id)}
+                            onChange={() => toggleJob(j.id)}
+                            aria-label={`Chọn job ${j.task_job_id}`}
+                          />
+                        </td>
+                        <td>#{j.task_job_id}</td>
+                        <td>{formatDateTime(j.updated_at)}</td>
+                        <td>{j.img_num}</td>
+                        <td className="col-assignee">
+                          <div className="assignee-cell">
+                            {assignees.length === 0 && !j.assignee_username ? (
+                              <span className="assignee-empty-hint">Thêm Assignees trước</span>
+                            ) : (
+                              <AssigneeCombobox
+                                users={assignees}
+                                value={j.assignee_username ?? ""}
+                                onAssign={(id) => assignJob(j.id, id)}
+                                onClear={j.assignee_username ? () => unassignJob(j.id) : undefined}
+                              />
+                            )}
+                          </div>
+                        </td>
+                        <td>{j.locked_by_username ?? "—"}</td>
+                        <td>
                           <select
-                            value={assignDraft[j.id] ?? ""}
-                            onChange={(e) =>
-                              setAssignDraft((d) => ({ ...d, [j.id]: e.target.value ? +e.target.value : 0 }))
-                            }
+                            className={`job-state-select is-picked state-${j.state}`}
+                            value={j.state}
+                            onChange={(e) => changeJobState(j.id, e.target.value)}
+                            onFocus={(e) => e.currentTarget.classList.remove("is-picked")}
+                            onBlur={(e) => e.currentTarget.classList.add("is-picked")}
+                            aria-label={`State job #${j.task_job_id}`}
                           >
-                            <option value="">—</option>
-                            {annotators.map((a) => (
-                              <option key={a.id} value={a.id}>
-                                {a.username}
+                            {JOB_STATES.map((s) => (
+                              <option key={s} value={s}>
+                                {s}
                               </option>
                             ))}
                           </select>
-                          <button type="button" className="assign-go" onClick={() => assignJob(j.id)}>
-                            Assign
+                        </td>
+                        <td className="col-actions">
+                          <button type="button" className="icon-btn-open" title="Mở job" onClick={() => openJob(j)}>
+                            <IconFolderOpen />
                           </button>
-                        </div>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td>{j.locked_by_username ?? "—"}</td>
-                    <td>
-                      <span className={`job-state state-${j.state}`}>{j.state}</span>
-                    </td>
-                    <td className="col-actions">
-                      <button type="button" className="icon-btn-open" title="Mở job" onClick={() => openJob(j)}>
-                        <IconFolderOpen />
-                      </button>
-                      <button
-                        type="button"
-                        className="icon-btn-export"
-                        title="Export job"
-                        onClick={() => exportOneJob(j.id)}
-                      >
-                        <IconExport size={16} />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {jobs.length === 0 && <p className="task-empty-hint">Không có job ở tab này.</p>}
-          </div>
+                          <button
+                            type="button"
+                            className="icon-btn-export"
+                            title="Export job"
+                            onClick={() =>
+                              setExportTarget({ kind: "job", jobId: j.id, taskJobId: j.task_job_id })
+                            }
+                          >
+                            <IconExport size={16} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
         </div>
+      )}
+
+      {importGoldenOpen && taskId && (
+        <ImportGoldenModal
+          taskId={taskId}
+          onClose={() => setImportGoldenOpen(false)}
+          onImported={() => loadGolden().catch(console.error)}
+        />
+      )}
+
+      {importTaskOpen && taskId && (
+        <ImportTaskModal
+          taskId={taskId}
+          onClose={() => setImportTaskOpen(false)}
+          onImported={() => {
+            loadJobs().catch(console.error);
+            loadGolden().catch(console.error);
+          }}
+        />
+      )}
+
+      {exportTarget && (
+        <ExportOptionsModal
+          title={exportTitle}
+          onClose={() => setExportTarget(null)}
+          onConfirm={(opts) => runExport(exportTarget, opts)}
+        />
+      )}
+
+      {assigneesOpen && taskId && (
+        <AssigneesModal
+          taskId={taskId}
+          onClose={() => setAssigneesOpen(false)}
+          onChanged={() => {
+            loadAssignees().catch(console.error);
+            loadJobs().catch(console.error);
+          }}
+        />
       )}
     </div>
   );

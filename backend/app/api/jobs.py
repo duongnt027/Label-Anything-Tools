@@ -1,11 +1,25 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_user, require_roles
-from app.models import Box, BoxStatus, Image, Job, JobState, LogAction, LogTargetType, Task, User, UserRole
-from app.schemas import AssignJobIn, JobOut
+from app.models import (
+    Box,
+    BoxStatus,
+    Image,
+    Job,
+    JobState,
+    LogAction,
+    LogTargetType,
+    Task,
+    TaskAssignee,
+    User,
+    UserRole,
+)
+from app.schemas import AssignJobIn, AutoAssignIn, JobOut, JobStateIn
 from app.services.jobs import (
+    clear_job_lock,
     count_job_images,
     refresh_annotator_locks,
     touch_job_lock,
@@ -19,7 +33,17 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 ERROR_IMAGE_TAGS = {"Thiếu box", "Thừa box", "Sai Caption"}
 
 
-def _job_out(db: Session, job: Job) -> JobOut:
+def _task_job_id(db: Session, job: Job) -> int:
+    """1-based job number within its task (not the global PK)."""
+    return (
+        db.query(func.count(Job.id))
+        .filter(Job.task_id == job.task_id, Job.id <= job.id)
+        .scalar()
+        or 0
+    )
+
+
+def _job_out(db: Session, job: Job, task_job_id: int | None = None) -> JobOut:
     img_num = count_job_images(db, job.id)
     if job.state in (JobState.need_review,) and job.review_stage == 2:
         total_boxes = (
@@ -45,6 +69,7 @@ def _job_out(db: Session, job: Job) -> JobOut:
     return JobOut(
         id=job.id,
         task_id=job.task_id,
+        task_job_id=task_job_id if task_job_id is not None else _task_job_id(db, job),
         state=job.state.value,
         img_num=img_num,
         annotator_process=job.annotator_process,
@@ -88,8 +113,9 @@ def _can_edit_job(user: User, job: Job, db: Session, view_as: str | None) -> tup
 
     if user.role == UserRole.reviewer:
         rev = _reviewer_for_job(db, job)
-        if rev and rev.id != user.id and user.role != UserRole.admin:
+        if not rev or rev.id != user.id:
             return False, False
+        # Can always view assignee jobs; edit only when need_review
         if job.state != JobState.need_review:
             return True, False
         if job.locked_by_id and job.locked_by_id != user.id:
@@ -107,9 +133,10 @@ def my_jobs(user: User = Depends(get_current_user), db: Session = Depends(get_db
         jobs = db.query(Job).filter(Job.assignee_id == user.id).order_by(Job.id.asc()).all()
     elif user.role == UserRole.reviewer:
         subs = db.query(User.id).filter(User.supervisor_id == user.id).subquery()
+        # All jobs of supervised annotators (view); edit gated by need_review on open
         jobs = (
             db.query(Job)
-            .filter(Job.assignee_id.in_(subs), Job.state == JobState.need_review)
+            .filter(Job.assignee_id.in_(subs))
             .order_by(Job.id.asc())
             .all()
         )
@@ -121,7 +148,7 @@ def my_jobs(user: User = Depends(get_current_user), db: Session = Depends(get_db
 @router.get("/by-task/{task_id}")
 def jobs_by_task(
     task_id: int,
-    tab: str = Query("annotator"),
+    tab: str = Query("all"),
     user: User = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
@@ -133,7 +160,18 @@ def jobs_by_task(
     elif tab == "review_s2":
         q = q.filter(Job.state == JobState.need_review, Job.review_stage == 2)
     jobs = q.order_by(Job.id).all()
+    # When listing all jobs of a task, local ids are consecutive 1..n.
+    # For filtered tabs, still number by creation order within the full task.
+    if tab == "all":
+        return [_job_out(db, j, task_job_id=i) for i, j in enumerate(jobs, start=1)]
     return [_job_out(db, j) for j in jobs]
+
+
+def _task_pool_user_ids(db: Session, task_id: int) -> set[int]:
+    return {
+        r.user_id
+        for r in db.query(TaskAssignee.user_id).filter(TaskAssignee.task_id == task_id).all()
+    }
 
 
 @router.post("/{job_id}/assign", response_model=JobOut)
@@ -146,30 +184,201 @@ def assign_job(
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404)
-    if job.assignee_id is not None:
-        raise HTTPException(400, "Job đã được assign, không thể đổi assignee")
-    annotator = db.get(User, body.assignee_id)
-    if not annotator or annotator.role != UserRole.annotator:
-        raise HTTPException(400, "Chỉ assign cho user role annotator")
-    job.assignee_id = annotator.id
+    assignee = db.get(User, body.assignee_id)
+    if not assignee or assignee.role not in (UserRole.annotator, UserRole.reviewer):
+        raise HTTPException(400, "Chỉ assign cho annotator hoặc reviewer")
+    if assignee.id not in _task_pool_user_ids(db, job.task_id):
+        raise HTTPException(400, "User chưa được thêm vào Assignees của task")
+    prev = job.assignee_id
+    job.assignee_id = assignee.id
     job.modifier_id = admin.id
+    # Reassigning to someone else clears an active lock from the previous holder.
+    if prev != assignee.id and job.locked_by_id is not None and job.locked_by_id != assignee.id:
+        clear_job_lock(db, job, admin.id, detail=f"Unlock due to reassign to {assignee.username}")
     write_log(
         db,
         actor_id=admin.id,
         action=LogAction.assign_job,
         target_type=LogTargetType.job,
         target_id=job.id,
-        detail=f"Assigned to {annotator.username}",
+        detail=f"Assigned to {assignee.username}" + (f" (was user #{prev})" if prev and prev != assignee.id else ""),
     )
     db.commit()
     db.refresh(job)
     return _job_out(db, job)
 
 
+@router.patch("/{job_id}/state", response_model=JobOut)
+def set_job_state(
+    job_id: int,
+    body: JobStateIn,
+    admin: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404)
+    try:
+        new_state = JobState(body.state)
+    except ValueError:
+        raise HTTPException(400, f"State không hợp lệ: {body.state}")
+    prev = job.state.value
+    job.state = new_state
+    if new_state == JobState.need_review and job.review_stage is None:
+        job.review_stage = 1
+    if new_state in (JobState.new, JobState.completed):
+        job.locked_by_id = None
+        job.locked_at = None
+    job.modifier_id = admin.id
+    write_log(
+        db,
+        actor_id=admin.id,
+        action=LogAction.change_job_state,
+        target_type=LogTargetType.job,
+        target_id=job.id,
+        detail=f"State {prev} → {new_state.value}",
+    )
+    db.commit()
+    db.refresh(job)
+    return _job_out(db, job)
+
+
+@router.post("/{job_id}/unassign", response_model=JobOut)
+def unassign_job(
+    job_id: int,
+    admin: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404)
+    if job.assignee_id is None:
+        return _job_out(db, job)
+    prev = job.assignee_id
+    job.assignee_id = None
+    job.modifier_id = admin.id
+    if job.locked_by_id == prev:
+        job.locked_by_id = None
+        job.locked_at = None
+    write_log(
+        db,
+        actor_id=admin.id,
+        action=LogAction.assign_job,
+        target_type=LogTargetType.job,
+        target_id=job.id,
+        detail=f"Unassigned (was user #{prev})",
+    )
+    db.commit()
+    db.refresh(job)
+    return _job_out(db, job)
+
+
+@router.post("/by-task/{task_id}/auto-assign")
+def auto_assign_jobs(
+    task_id: int,
+    body: AutoAssignIn | None = None,
+    admin: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    """Assign unassigned jobs evenly across the task assignee pool."""
+    if not db.get(Task, task_id):
+        raise HTTPException(404)
+
+    pool_ids = _task_pool_user_ids(db, task_id)
+    if not pool_ids:
+        raise HTTPException(400, "Chưa có thành viên khả thi để tự assign — thêm vào Assignees trước")
+
+    # Only members already in the persisted pool (ignore body ids outside the pool).
+    requested = set(body.assignee_ids) if body and body.assignee_ids else pool_ids
+    member_ids = sorted(pool_ids & requested)
+    if not member_ids:
+        raise HTTPException(400, "Không có thành viên trong Assignees để auto assign")
+
+    member_set = set(member_ids)
+    jobs = db.query(Job).filter(Job.task_id == task_id).order_by(Job.id).all()
+
+    counts: dict[int, int] = {mid: 0 for mid in member_ids}
+    for job in jobs:
+        if job.assignee_id in member_set:
+            counts[job.assignee_id] += 1
+
+    unassigned = [j for j in jobs if j.assignee_id is None]
+    assigned_n = 0
+    for job in unassigned:
+        best = min(member_ids, key=lambda mid: (counts[mid], mid))
+        job.assignee_id = best
+        job.modifier_id = admin.id
+        counts[best] += 1
+        assigned_n += 1
+        write_log(
+            db,
+            actor_id=admin.id,
+            action=LogAction.assign_job,
+            target_type=LogTargetType.job,
+            target_id=job.id,
+            detail=f"Auto-assigned to user #{best}",
+        )
+
+    db.commit()
+    return {"assigned": assigned_n, "counts": counts}
+
+
+@router.post("/{job_id}/unlock", response_model=JobOut)
+def unlock_job(
+    job_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Leave workspace → unlock immediately. Timeout only applies while still inside."""
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404)
+    if job.locked_by_id is None:
+        return _job_out(db, job)
+    if job.locked_by_id != user.id and user.role != UserRole.admin:
+        raise HTTPException(403, "Job đang bị người khác lock")
+    clear_job_lock(db, job, user.id, detail="Unlock on leave")
+    job.modifier_id = user.id
+    db.commit()
+    db.refresh(job)
+    return _job_out(db, job)
+
+
+def _admin_view_permissions(
+    job: Job, view_as: str | None, admin_view: str | None, admin_id: int
+) -> tuple[bool, bool, str]:
+    """Admin preview: can always view; edit only on the job's current stage screen."""
+    screen = admin_view if admin_view in ("annotator", "s1", "s2") else None
+    if screen is None:
+        if view_as == "annotator":
+            screen = "annotator"
+        elif view_as == "reviewer":
+            screen = "s2" if (job.review_stage or 1) == 2 else "s1"
+        else:
+            return True, False, "admin"
+
+    effective = "annotator" if screen == "annotator" else "reviewer"
+    stage_ok = False
+    if screen == "annotator":
+        stage_ok = job.state in (JobState.new, JobState.rejected, JobState.in_progress)
+    elif screen == "s1":
+        stage_ok = job.state == JobState.need_review and (job.review_stage or 1) == 1
+    elif screen == "s2":
+        stage_ok = job.state == JobState.need_review and job.review_stage == 2
+
+    if not stage_ok:
+        return True, False, effective
+    # Edit when unlocked or already locked by this admin
+    if job.locked_by_id is None or job.locked_by_id == admin_id:
+        return True, True, effective
+    return True, False, effective
+
+
 @router.post("/{job_id}/open")
 def open_job(
     job_id: int,
     view_as: str | None = Query(None),
+    admin_view: str | None = Query(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -177,35 +386,21 @@ def open_job(
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404)
-    if user.role == UserRole.admin and view_as in ("annotator", "reviewer"):
-        effective_role = view_as
-        if view_as == "annotator":
-            if job.assignee_id and job.assignee_id != user.id:
-                can_view, can_edit = True, False
-            elif job.state in (JobState.new, JobState.rejected, JobState.in_progress):
-                if job.locked_by_id and job.locked_by_id != user.id:
-                    can_view, can_edit = True, False
-                else:
-                    can_view, can_edit = True, True
-            else:
-                can_view, can_edit = True, False
-        elif view_as == "reviewer":
-            if job.state != JobState.need_review:
-                can_view, can_edit = True, False
-            elif job.locked_by_id and job.locked_by_id != user.id:
-                can_view, can_edit = True, False
-            else:
-                can_view, can_edit = True, True
-        else:
-            can_view, can_edit = _can_edit_job(user, job, db, view_as)
+
+    if user.role == UserRole.admin and (
+        view_as in ("annotator", "reviewer") or admin_view in ("annotator", "s1", "s2")
+    ):
+        can_view, can_edit, effective_role = _admin_view_permissions(
+            job, view_as, admin_view, user.id
+        )
     else:
         can_view, can_edit = _can_edit_job(user, job, db, view_as)
+        effective_role = user.role.value
+        if user.role == UserRole.admin and view_as in ("annotator", "reviewer"):
+            effective_role = view_as
+
     if not can_view:
         raise HTTPException(403)
-
-    effective_role = user.role.value
-    if user.role == UserRole.admin and view_as in ("annotator", "reviewer"):
-        effective_role = view_as
 
     if can_edit:
         if job.state == JobState.rejected and effective_role == "annotator":
@@ -284,7 +479,9 @@ def view_image(
         job.annotator_process = max(job.annotator_process, idx + 1)
     elif job.state == JobState.need_review and job.review_stage == 1:
         job.review_s1_process = max(job.review_s1_process, idx + 1)
-    touch_job_lock(db, job, user.id)
+    # Only refresh lock timeout while the current user still holds the lock.
+    if job.locked_by_id == user.id:
+        touch_job_lock(db, job, user.id)
     write_log(
         db,
         actor_id=user.id,
@@ -356,7 +553,12 @@ def review_stage2_submit(job_id: int, user: User = Depends(get_current_user), db
     if not job or (user.role != UserRole.admin and (not rev or rev.id != user.id)):
         raise HTTPException(403)
     boxes = db.query(Box).join(Image).filter(Image.job_id == job_id).all()
-    for box in boxes:
+    s2_boxes = [
+        box
+        for box in boxes
+        if "Accept S1" in (box.image.tag or []) or "Accept All" in (box.image.tag or [])
+    ]
+    for box in s2_boxes:
         if box.tag:
             box.status = BoxStatus.Rejected
         elif box.status == BoxStatus.Unseen:
@@ -364,6 +566,8 @@ def review_stage2_submit(job_id: int, user: User = Depends(get_current_user), db
     imgs = db.query(Image).filter(Image.job_id == job_id).all()
     for img in imgs:
         tags = list(img.tag or [])
+        if "Accept S1" not in tags and "Accept All" not in tags:
+            continue
         if "Sai Caption" in tags:
             continue
         all_accepted = all(b.status == BoxStatus.Accepted for b in img.boxes)
@@ -371,10 +575,29 @@ def review_stage2_submit(job_id: int, user: User = Depends(get_current_user), db
             if "Accept All" not in tags:
                 tags.append("Accept All")
             img.tag = tags
-    job.review_s2_process = len(boxes)
+    job.review_s2_process = len(s2_boxes)
     job.modifier_id = user.id
     db.commit()
     return {"boxes": len(boxes)}
+
+
+def _job_has_review_issues(db: Session, job_id: int) -> bool:
+    """True if any box is Rejected or any image still carries error tags."""
+    rejected_boxes = (
+        db.query(Box.id)
+        .join(Image)
+        .filter(Image.job_id == job_id, Box.status == BoxStatus.Rejected)
+        .limit(1)
+        .first()
+    )
+    if rejected_boxes:
+        return True
+    imgs = db.query(Image).filter(Image.job_id == job_id).all()
+    for img in imgs:
+        tags = list(img.tag or [])
+        if any(t in ERROR_IMAGE_TAGS for t in tags):
+            return True
+    return False
 
 
 @router.post("/{job_id}/accept")
@@ -385,15 +608,24 @@ def accept_job(job_id: int, user: User = Depends(get_current_user), db: Session 
         raise HTTPException(400)
     if user.role != UserRole.admin and (not rev or rev.id != user.id):
         raise HTTPException(403)
-    job.state = JobState.completed
+    # Cannot complete a job that still has rejected boxes / image error tags
+    if _job_has_review_issues(db, job.id):
+        job.state = JobState.rejected
+        action = LogAction.reject_job
+        detail = "auto-rejected: has Rejected boxes or image error tags"
+    else:
+        job.state = JobState.completed
+        action = LogAction.accept_job
+        detail = ""
     job.locked_by_id = None
     job.locked_at = None
     write_log(
         db,
         actor_id=user.id,
-        action=LogAction.accept_job,
+        action=action,
         target_type=LogTargetType.job,
         target_id=job.id,
+        detail=detail,
     )
     job.modifier_id = user.id
     db.commit()
@@ -425,6 +657,7 @@ def reject_job(job_id: int, user: User = Depends(get_current_user), db: Session 
 
 @router.get("/{job_id}/stage2/boxes")
 def stage2_boxes(job_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Only boxes from images that passed Stage 1 (Accept S1 / Accept All)."""
     boxes = (
         db.query(Box)
         .join(Image)
@@ -434,6 +667,9 @@ def stage2_boxes(job_id: int, user: User = Depends(get_current_user), db: Sessio
     )
     result = []
     for b in boxes:
+        tags = set(b.image.tag or [])
+        if "Accept S1" not in tags and "Accept All" not in tags:
+            continue
         d = box_to_dict(b)
         d["image_source"] = b.image.image_source
         result.append(d)

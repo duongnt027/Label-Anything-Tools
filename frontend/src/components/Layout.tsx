@@ -28,6 +28,34 @@ const IconLogout = () => (
   </svg>
 );
 
+const LogoMark = ({ size = 28 }: { size?: number }) => (
+  <svg
+    className="sidebar-logo-mark"
+    width={size}
+    height={size}
+    viewBox="0 0 32 32"
+    fill="none"
+    aria-hidden
+  >
+    <rect width="32" height="32" rx="8" fill="#6366f1" />
+    <path
+      d="M8 22V10h6.2c2.4 0 3.9 1.35 3.9 3.35 0 1.35-.7 2.4-1.85 2.9L20.5 22h-3.15l-3.7-5.1H11V22H8Zm3-7.55h2.85c.95 0 1.5-.5 1.5-1.25s-.55-1.2-1.5-1.2H11v2.45Z"
+      fill="#fff"
+    />
+    <rect x="18.5" y="8.5" width="6" height="6" rx="1.5" stroke="#c7d2fe" strokeWidth="1.5" fill="none" />
+  </svg>
+);
+
+const IconPanelToggle = ({ collapsed }: { collapsed: boolean }) => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+    {collapsed ? (
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 6l6 6-6 6" />
+    ) : (
+      <path strokeLinecap="round" strokeLinejoin="round" d="M15 6l-6 6 6 6" />
+    )}
+  </svg>
+);
+
 function roleLabel(role: string) {
   return role.toUpperCase();
 }
@@ -39,7 +67,8 @@ export default function Layout() {
   const location = useLocation();
   const nav = useNavigate();
 
-  const isAnnotate = /^\/jobs\/\d+/.test(location.pathname) && !location.pathname.includes("review-s2");
+  const isAnnotate =
+    /^\/jobs\/\d+/.test(location.pathname) || /^\/golden\/\d+/.test(location.pathname);
   const flushMain = isAnnotate;
 
   if (loading) return <div className="center">Đang tải...</div>;
@@ -52,7 +81,10 @@ export default function Layout() {
     <div className="app-shell">
       <aside className={`sidebar ${collapsed ? "sidebar-collapsed" : ""}`}>
         <div className="sidebar-header">
-          {!collapsed && <span className="sidebar-brand">Label Anything</span>}
+          <div className="sidebar-brand-row">
+            <LogoMark size={collapsed ? 20 : 24} />
+            {!collapsed && <span className="sidebar-brand">Label Anything</span>}
+          </div>
           <button
             type="button"
             className="sidebar-icon-btn sidebar-toggle-btn"
@@ -60,9 +92,7 @@ export default function Layout() {
             title={collapsed ? "Mở rộng sidebar" : "Thu gọn sidebar"}
             aria-label={collapsed ? "Mở rộng sidebar" : "Thu gọn sidebar"}
           >
-            <span className="sidebar-toggle-glyph" aria-hidden>
-              {collapsed ? ">" : "<"}
-            </span>
+            <IconPanelToggle collapsed={collapsed} />
           </button>
         </div>
         <div className={`sidebar-user ${collapsed ? "sidebar-user-collapsed" : ""}`}>

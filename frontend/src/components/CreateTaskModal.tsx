@@ -113,7 +113,7 @@ export function CreateTaskModal({ onClose, onCreated }: { onClose: () => void; o
 
         <div className="field">
           <label className="field-label">Classes</label>
-          <div className="class-chips-wrap class-chips-scroll">
+          <div className="class-chips-wrap class-chips-scroll pretty-scroll">
             {classChips.map((c) => (
               <span
                 key={c.name}

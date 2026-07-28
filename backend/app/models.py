@@ -11,6 +11,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
@@ -118,6 +119,25 @@ class Task(Base):
 
     jobs = relationship("Job", back_populates="task", cascade="all, delete-orphan")
     images = relationship("Image", back_populates="task", cascade="all, delete-orphan")
+    assignees = relationship("TaskAssignee", back_populates="task", cascade="all, delete-orphan")
+
+
+class TaskAssignee(Base):
+    """Users allowed to be assigned to jobs of this task."""
+
+    __tablename__ = "task_assignees"
+    __table_args__ = (
+        UniqueConstraint("task_id", "user_id", name="uq_task_assignee"),
+        Index("ix_task_assignees_task_id", "task_id"),
+        Index("ix_task_assignees_user_id", "user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("task.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    task = relationship("Task", back_populates="assignees")
+    user = relationship("User")
 
 
 class Job(Base):

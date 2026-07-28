@@ -1,62 +1,84 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { api, Box, imageUrl, LaImage } from "../api";
-import AnnotationCanvas from "../components/AnnotationCanvas";
+import { api, Box, LaImage } from "../api";
+import AnnotationScreen from "../components/AnnotationScreen";
+
+type TaskLite = { id: number; classes?: string[] };
 
 export default function GoldenEditor() {
   const { imageId } = useParams();
   const nav = useNavigate();
-  const [img, setImg] = useState<LaImage | null>(null);
+  const [images, setImages] = useState<LaImage[]>([]);
+  const [idx, setIdx] = useState(0);
   const [boxes, setBoxes] = useState<Box[]>([]);
-  const [selected, setSelected] = useState<number | null>(null);
-
-  const reloadBoxes = () => {
-    if (!imageId) return;
-    api<Box[]>(`/api/images/${imageId}/boxes`).then(setBoxes);
-  };
+  const [taskClasses, setTaskClasses] = useState<string[]>([]);
+  const [taskId, setTaskId] = useState<number | null>(null);
 
   useEffect(() => {
     if (!imageId) return;
-    api<LaImage>(`/api/images/${imageId}`).then(setImg);
-    reloadBoxes();
+    api<LaImage>(`/api/images/${imageId}`).then(async (img) => {
+      const tid = img.task_id;
+      if (!tid) {
+        setImages([img]);
+        setIdx(0);
+        return;
+      }
+      setTaskId(tid);
+      try {
+        const task = await api<TaskLite>(`/api/tasks/${tid}`);
+        setTaskClasses(task.classes || []);
+      } catch {
+        /* ignore */
+      }
+      try {
+        const pool = await api<LaImage[]>(`/api/tasks/${tid}/golden-pool`);
+        setImages(pool.length ? pool : [img]);
+        const i = pool.findIndex((g) => g.id === img.id);
+        setIdx(i >= 0 ? i : 0);
+      } catch {
+        setImages([img]);
+        setIdx(0);
+      }
+    });
   }, [imageId]);
 
-  const addBox = async (points: string) => {
-    if (!img) return;
-    await api(`/api/images/${img.id}/boxes`, {
-      method: "POST",
-      body: JSON.stringify({ class: "golden", box_points: points }),
-    });
-    reloadBoxes();
+  const current = images[idx];
+
+  useEffect(() => {
+    if (!current) return;
+    api<Box[]>(`/api/images/${current.id}/boxes`).then(setBoxes);
+  }, [current?.id]);
+
+  const reloadBoxes = () => {
+    if (!current) return;
+    api<Box[]>(`/api/images/${current.id}/boxes`).then(setBoxes);
   };
 
-  if (!img) return <div>Đang tải...</div>;
+  const tid = taskId ?? current?.task_id;
+  if (!current || tid == null) {
+    return (
+      <div className="annotate-root">
+        <div className="annotate-loading">Đang tải...</div>
+      </div>
+    );
+  }
 
   return (
-    <div>
-      <button type="button" onClick={() => nav(-1)}>
-        ← Quay lại
-      </button>
-      <h3>Golden #{img.id}</h3>
-      <div className="workspace" style={{ gridTemplateColumns: "200px 1fr" }}>
-        <div className="panel">
-          {boxes.map((b) => (
-            <button key={b.id} type="button" onClick={() => setSelected(b.id)}>
-              #{b.id} {b.class}
-            </button>
-          ))}
-        </div>
-        <div className="panel">
-          <AnnotationCanvas
-            imageUrl={imageUrl(img.id)}
-            boxes={boxes}
-            selectedId={selected}
-            tool="box"
-            onSelect={setSelected}
-            onCreateBox={addBox}
-          />
-        </div>
-      </div>
-    </div>
+    <AnnotationScreen
+      mode="golden"
+      images={images}
+      idx={idx}
+      onIdxChange={setIdx}
+      boxes={boxes}
+      onReloadBoxes={reloadBoxes}
+      onBoxesChange={(fn) => setBoxes(fn)}
+      taskId={tid}
+      taskClasses={taskClasses}
+      onTaskClassesChange={setTaskClasses}
+      canEdit
+      onBack={() => nav(`/admin/tasks/${tid}?tab=golden`)}
+      onImagesChange={(fn) => setImages(fn)}
+      showGoldenToggle
+    />
   );
 }
