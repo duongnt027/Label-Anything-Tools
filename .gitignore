@@ -8,3 +8,6 @@ storage/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+sample_images/
+test_output/
+.cursor/
