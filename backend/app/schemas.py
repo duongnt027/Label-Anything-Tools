@@ -38,7 +38,7 @@ class TaskCreate(BaseModel):
     chunk_size: int = 50
     classes: list[str] = Field(default_factory=list)
     min_role_to_add_class: str = "admin"
-    golden_per_job: int = 0
+    golden_per_job: int = 2
 
 
 class TaskOut(BaseModel):
@@ -89,6 +89,11 @@ class TaskAssigneesIn(BaseModel):
     user_ids: list[int]
 
 
+class TrackBoxesDeleteIn(BaseModel):
+    track_id: str
+    from_order_index: int = 0
+
+
 class BoxIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -132,3 +137,16 @@ class ExportGoldenOptions(BaseModel):
     include_images: bool = False
     box_visibility: str = "all"
     image_ids: list[int] | None = None
+
+
+class MountDirEntry(BaseModel):
+    name: str
+    path: str
+    has_children: bool
+    image_count: int
+
+
+class MountTreeOut(BaseModel):
+    path: str
+    parent: str | None
+    entries: list[MountDirEntry]

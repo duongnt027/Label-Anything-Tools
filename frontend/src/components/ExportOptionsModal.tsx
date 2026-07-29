@@ -54,7 +54,10 @@ export function ExportOptionsModal({
           />
           <span>Kèm ảnh</span>
         </label>
-        <p className="field-hint">Nếu bật, mỗi ảnh sẽ kèm `image_base64` trong JSON.</p>
+        <p className="field-hint">
+          Export file ZIP: <code>annos.json</code> và (nếu bật) thư mục <code>images/</code>. Box dùng{" "}
+          <code>x_center</code>, <code>y_center</code>, <code>w</code>, <code>h</code>.
+        </p>
 
         <fieldset className="export-box-visibility">
           <legend>Visible box</legend>

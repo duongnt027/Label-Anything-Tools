@@ -109,7 +109,7 @@ class Task(Base):
         Enum(MinRoleToAddClass, name="min_role_to_add_class"),
         default=MinRoleToAddClass.admin,
     )
-    golden_per_job: Mapped[int] = mapped_column(Integer, default=0)
+    golden_per_job: Mapped[int] = mapped_column(Integer, default=2)
     chunk_size: Mapped[int] = mapped_column(Integer, default=50)
     modifier_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_gmt7)

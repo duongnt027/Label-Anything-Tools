@@ -5,11 +5,11 @@
  */
 const GOLDEN_ANGLE = 137.508;
 
-/** Vary S/L slightly so near-wrap hues still read apart. */
+/** Border colors for outlined class chips — higher saturation like design reference. */
 function hslParts(index: number): { h: number; s: number; l: number } {
   const h = (index * GOLDEN_ANGLE) % 360;
-  const s = 58 + ((index * 7) % 18); // 58–75%
-  const l = 40 + ((index * 11) % 16); // 40–55%
+  const s = 68 + ((index * 5) % 14); // 68–81%
+  const l = 52 + ((index * 9) % 12); // 52–63%
   return { h, s, l };
 }
 

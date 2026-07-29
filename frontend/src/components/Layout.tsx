@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Navigate, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth";
 import UserSettingsModal from "./UserSettingsModal";
+import AppLogo from "./AppLogo";
 import { roleBadgeClass } from "../utils/roleBadge";
 
 const IconDashboard = () => (
@@ -25,24 +26,6 @@ const IconLogout = () => (
     <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
     <polyline points="16 17 21 12 16 7" />
     <line x1="21" y1="12" x2="9" y2="12" />
-  </svg>
-);
-
-const LogoMark = ({ size = 28 }: { size?: number }) => (
-  <svg
-    className="sidebar-logo-mark"
-    width={size}
-    height={size}
-    viewBox="0 0 32 32"
-    fill="none"
-    aria-hidden
-  >
-    <rect width="32" height="32" rx="8" fill="#6366f1" />
-    <path
-      d="M8 22V10h6.2c2.4 0 3.9 1.35 3.9 3.35 0 1.35-.7 2.4-1.85 2.9L20.5 22h-3.15l-3.7-5.1H11V22H8Zm3-7.55h2.85c.95 0 1.5-.5 1.5-1.25s-.55-1.2-1.5-1.2H11v2.45Z"
-      fill="#fff"
-    />
-    <rect x="18.5" y="8.5" width="6" height="6" rx="1.5" stroke="#c7d2fe" strokeWidth="1.5" fill="none" />
   </svg>
 );
 
@@ -82,7 +65,7 @@ export default function Layout() {
       <aside className={`sidebar ${collapsed ? "sidebar-collapsed" : ""}`}>
         <div className="sidebar-header">
           <div className="sidebar-brand-row">
-            <LogoMark size={collapsed ? 20 : 24} />
+            <AppLogo size={collapsed ? 28 : 32} className="sidebar-logo-img" alt="" />
             {!collapsed && <span className="sidebar-brand">Label Anything</span>}
           </div>
           <button

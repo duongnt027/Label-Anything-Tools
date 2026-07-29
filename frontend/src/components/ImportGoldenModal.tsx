@@ -1,4 +1,9 @@
 import { FormEvent, useState } from "react";
+import { getToken } from "../api";
+import { MountFolderTree } from "./MountFolderTree";
+import { ZipDropZone } from "./ZipDropZone";
+import { ModalBusyOverlay } from "./ModalBusyOverlay";
+import { useZipDropCapture } from "./useZipDropCapture";
 
 export function ImportGoldenModal({
   taskId,
@@ -10,18 +15,28 @@ export function ImportGoldenModal({
   onImported: () => void;
 }) {
   const [uploadTab, setUploadTab] = useState<"mount" | "zip">("mount");
-  const [mountPath, setMountPath] = useState("sample_images");
+  const [mountPath, setMountPath] = useState("");
   const [zipFile, setZipFile] = useState<File | null>(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
+  useZipDropCapture({
+    active: !busy,
+    disabled: busy,
+    onZip: (f) => {
+      setUploadTab("zip");
+      setZipFile(f);
+    },
+  });
+
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (busy) return;
     setErr("");
     const fd = new FormData();
     if (uploadTab === "mount") {
       if (!mountPath.trim()) {
-        setErr("Nhập đường dẫn mount");
+        setErr("Chọn thư mục mount");
         return;
       }
       fd.append("server_folder", mountPath.trim());
@@ -36,7 +51,8 @@ export function ImportGoldenModal({
     try {
       const r = await fetch(`/api/tasks/${taskId}/golden-pool/import`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${localStorage.getItem("la_token")}` },
+        headers: { Authorization: `Bearer ${getToken()}` },
+        credentials: "same-origin",
         body: fd,
       });
       if (!r.ok) {
@@ -52,69 +68,86 @@ export function ImportGoldenModal({
     }
   };
 
+  const uploadCaption =
+    uploadTab === "mount"
+      ? mountPath.trim() || "Chưa chọn thư mục"
+      : zipFile
+        ? zipFile.name
+        : "Chưa chọn file ZIP";
+  const uploadCaptionTitle = uploadTab === "mount" ? mountPath.trim() || undefined : zipFile?.name;
+
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <form
-        className="admin-modal import-golden-modal"
-        onSubmit={submit}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="modal-head">
-          <h3>Import golden pool</h3>
-          <button type="button" className="icon-btn-ghost" onClick={onClose} title="Đóng">
-            ✕
-          </button>
-        </div>
-
-        <div className="task-screen-tabs import-golden-tabs">
-          <button
-            type="button"
-            className={`task-screen-tab ${uploadTab === "mount" ? "active" : ""}`}
-            onClick={() => setUploadTab("mount")}
-          >
-            Mount
-          </button>
-          <button
-            type="button"
-            className={`task-screen-tab ${uploadTab === "zip" ? "active" : ""}`}
-            onClick={() => setUploadTab("zip")}
-          >
-            Import ZIP
-          </button>
-        </div>
-
-        {uploadTab === "mount" ? (
-          <div className="field">
-            <label className="field-label field-label-req">Đường dẫn trên server</label>
-            <input
-              value={mountPath}
-              onChange={(e) => setMountPath(e.target.value)}
-              placeholder="sample_images"
-            />
-            <p className="field-hint">Thư mục mount trong container (vd: sample_images)</p>
+    <div
+      className={`modal-backdrop ${busy ? "modal-busy" : ""}`}
+      onDragOver={(e) => {
+        if (busy) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      }}
+      onDrop={(e) => {
+        if (busy) return;
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    >
+      <div className="create-task-modal-shell import-golden-modal-shell">
+        <ModalBusyOverlay show={busy} label="Đang import golden pool…" />
+        <form className="create-task-modal import-golden-modal" onSubmit={submit}>
+          <div className="modal-head create-task-modal-head">
+            <h3>Import golden pool</h3>
+            <button type="button" className="icon-btn-ghost" onClick={onClose} title="Đóng" disabled={busy}>
+              ✕
+            </button>
           </div>
-        ) : (
-          <div className="field">
-            <label className="field-label field-label-req">File ZIP</label>
-            <input
-              type="file"
-              accept=".zip,application/zip"
-              onChange={(e) => setZipFile(e.target.files?.[0] ?? null)}
-            />
+
+          <div className="create-task-modal-body">
+            <div className="task-screen-tabs create-task-upload-tabs">
+              <button
+                type="button"
+                className={`task-screen-tab ${uploadTab === "mount" ? "active" : ""}`}
+                onClick={() => setUploadTab("mount")}
+                disabled={busy}
+              >
+                Mount
+              </button>
+              <button
+                type="button"
+                className={`task-screen-tab ${uploadTab === "zip" ? "active" : ""}`}
+                onClick={() => setUploadTab("zip")}
+                disabled={busy}
+              >
+                Upload ZIP
+              </button>
+            </div>
+
+            <div className="create-task-upload-block">
+              <div className="create-task-upload-panel">
+                {uploadTab === "mount" ? (
+                  <MountFolderTree value={mountPath} onChange={setMountPath} disabled={busy} />
+                ) : (
+                  <div className="create-task-scroll-shell create-task-zip-shell">
+                    <ZipDropZone file={zipFile} onFile={setZipFile} disabled={busy} />
+                  </div>
+                )}
+              </div>
+              <p className="create-task-upload-caption" title={uploadCaptionTitle}>
+                {uploadCaption}
+              </p>
+            </div>
+
+            {err && <p className="form-error">{err}</p>}
           </div>
-        )}
 
-        {err && <p className="form-error">{err}</p>}
-
-        <div className="modal-actions-split">
-          <button type="button" className="topbar-btn" onClick={onClose} disabled={busy}>
-            Huỷ
-          </button>
-          <button type="submit" className="topbar-btn primary" disabled={busy}>
-            {busy ? "Đang import…" : "Import"}
-          </button>
-        </div>
-      </form>
+          <div className="modal-actions-split">
+            <button type="button" className="topbar-btn" onClick={onClose} disabled={busy}>
+              Huỷ
+            </button>
+            <button type="submit" className="topbar-btn primary" disabled={busy}>
+              {busy ? "Đang import…" : "Import"}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }

@@ -15,6 +15,7 @@ export function ClassCombobox({
   onChange,
   onCommitNew,
   classIndex,
+  onFocusField,
 }: {
   classes: string[];
   value: string;
@@ -23,6 +24,7 @@ export function ClassCombobox({
   onChange: (className: string) => void;
   onCommitNew: (className: string) => void | Promise<void>;
   classIndex: Map<string, number>;
+  onFocusField?: () => void;
 }) {
   const [query, setQuery] = useState(value);
   const [open, setOpen] = useState(false);
@@ -275,6 +277,7 @@ export function ClassCombobox({
             setPickerOpen(false);
           }}
           onFocus={() => {
+            onFocusField?.();
             setOpen(true);
             setPickerOpen(false);
           }}
@@ -285,6 +288,7 @@ export function ClassCombobox({
             type="button"
             className="btn-x class-combo-picker-btn"
             title="Chọn class khác"
+            onMouseDown={(e) => e.preventDefault()}
             onClick={() => {
               setPickerOpen((v) => !v);
               setOpen(false);

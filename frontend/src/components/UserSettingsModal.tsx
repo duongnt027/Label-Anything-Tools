@@ -73,14 +73,15 @@ export default function UserSettingsModal({ onClose }: { onClose: () => void }) 
 
   const removeUser = async (u: User, e: MouseEvent) => {
     e.stopPropagation();
-    if (u.username === "admin" || u.role === "admin") {
-      const firstAdmin = users.filter((x) => x.role === "admin").sort((a, b) => a.id - b.id)[0];
-      if (firstAdmin?.id === u.id) return;
-    }
+    if (isProtectedAdmin(u)) return;
     if (!confirm(`Xóa user ${u.username}?`)) return;
-    await api(`/api/users/${u.id}`, { method: "DELETE" });
-    if (selected?.id === u.id) setSelected(null);
-    await load();
+    try {
+      await api(`/api/users/${u.id}`, { method: "DELETE" });
+      if (selected?.id === u.id) setSelected(null);
+      await load();
+    } catch (ex) {
+      alert(ex instanceof Error ? ex.message : "Không xóa được user");
+    }
   };
 
   const isProtectedAdmin = (u: User) => {

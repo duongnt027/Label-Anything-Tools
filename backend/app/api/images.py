@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+import json
+
 from app.database import get_db
 from app.deps import get_current_user
 from app.models import Box, BoxStatus, Image, Job, JobState, LogAction, LogTargetType, User, UserRole
@@ -66,6 +68,75 @@ def _annotator_may_clear_accept(user: User, job: Job | None) -> bool:
     return False
 
 
+_GOLDEN_REF_PREFIX = "golden_pool_id:"
+
+
+def _split_details_body_golden(raw: str | None) -> tuple[str, str]:
+    if not raw:
+        return "", ""
+    golden: list[str] = []
+    rest: list[str] = []
+    for part in raw.split("|"):
+        p = part.strip()
+        if p.startswith(_GOLDEN_REF_PREFIX):
+            golden.append(p)
+        else:
+            rest.append(part)
+    return "|".join(rest).strip(), "|".join(golden)
+
+
+def _merge_details_body_golden(body: str, golden: str) -> str | None:
+    b = (body or "").strip()
+    g = (golden or "").strip()
+    if b and g:
+        return f"{b}|{g}"
+    if b:
+        return b
+    if g:
+        return g
+    return None
+
+
+def _parse_tag_details_map(raw: str) -> dict[str, str]:
+    if not raw.strip():
+        return {}
+    try:
+        o = json.loads(raw)
+        if isinstance(o, dict):
+            return {str(k): str(v) for k, v in o.items() if isinstance(v, str)}
+    except json.JSONDecodeError:
+        pass
+    return {"_note": raw}
+
+
+def _serialize_tag_details_map(m: dict[str, str]) -> str:
+    clean = {k: v for k, v in m.items() if k != "_note" and (v or "").strip()}
+    if not clean:
+        return (m.get("_note") or "").strip()
+    return json.dumps(clean, ensure_ascii=False)
+
+
+def _prune_image_tag_details(details: str | None, tags: list[str]) -> str | None:
+    body, golden = _split_details_body_golden(details)
+    if not body and not golden:
+        return details
+    m = _parse_tag_details_map(body)
+    tag_set = set(tags)
+    for k in list(m.keys()):
+        if k != "_note" and k not in tag_set:
+            del m[k]
+    new_body = _serialize_tag_details_map(m)
+    return _merge_details_body_golden(new_body, golden)
+
+
+def _remove_one_tag_from_details(details: str | None, tag: str) -> str | None:
+    body, golden = _split_details_body_golden(details)
+    m = _parse_tag_details_map(body)
+    m.pop(tag, None)
+    new_body = _serialize_tag_details_map(m)
+    return _merge_details_body_golden(new_body, golden)
+
+
 @router.patch("/{image_id}")
 def update_image(
     image_id: int,
@@ -94,6 +165,7 @@ def update_image(
             if added - _ACCEPT_TAGS:
                 raise HTTPException(400, "Xóa Accept S1 / Accept All trước khi thêm tag khác")
         img.tag = new_tags
+        img.details = _prune_image_tag_details(img.details, new_tags)
     # Accept S1/All: reviewer removes manually; annotator clears only via caption / add-delete box
     if caption_changed and _annotator_may_clear_accept(user, job):
         _strip_accept_tags(img)
@@ -109,9 +181,6 @@ def update_image(
         )
     db.commit()
     return image_to_dict(img)
-
-
-_GOLDEN_REF_PREFIX = "golden_pool_id:"
 
 
 def _parse_golden_ref(details: str | None) -> int | None:
@@ -358,6 +427,7 @@ def remove_image_tag(
     if tag_name in _ACCEPT_TAGS and user.role == UserRole.annotator:
         raise HTTPException(403, "Annotator cannot remove Accept S1 / Accept All")
     img.tag = [t for t in (img.tag or []) if t != tag_name]
+    img.details = _remove_one_tag_from_details(img.details, tag_name)
     img.modifier_id = user.id
     db.commit()
     return image_to_dict(img)

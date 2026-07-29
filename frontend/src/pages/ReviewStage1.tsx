@@ -1,6 +1,12 @@
 import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { api, Box, imageUrl, Job, LaImage } from "../api";
 import AnnotationCanvas from "../components/AnnotationCanvas";
+import {
+  commitImageTagDetails,
+  mergeImageDetailsMeta,
+  parseTagDetails,
+  splitImageDetailsMeta,
+} from "../utils/tagDetails";
 
 const IMAGE_ERROR_TAGS = ["Thiếu box", "Sai Caption"];
 const ACCEPT_TAGS = new Set(["Accept S1", "Accept All"]);
@@ -17,6 +23,10 @@ type Props = {
   onJobChange: (job: Job) => void;
   onContinueS2: () => void | Promise<void>;
   headerAfterProgress?: ReactNode;
+  /** Initial frame after resume prompt (0-based). */
+  bootIndex?: number;
+  /** When false, defer loading boxes / view_image until user picks resume. */
+  workspaceReady?: boolean;
 };
 
 export default function ReviewStage1({
@@ -30,11 +40,27 @@ export default function ReviewStage1({
   onJobChange,
   onContinueS2,
   headerAfterProgress,
+  bootIndex = 0,
+  workspaceReady = true,
 }: Props) {
   const [idx, setIdx] = useState(0);
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [busy, setBusy] = useState(false);
+  const [detailTag, setDetailTag] = useState<string | null>(null);
   const imageListRef = useRef<HTMLDivElement>(null);
+  const bootSyncedRef = useRef(false);
+
+  useEffect(() => {
+    if (!workspaceReady) bootSyncedRef.current = false;
+  }, [workspaceReady]);
+
+  useEffect(() => {
+    if (!workspaceReady || !images.length) return;
+    if (bootSyncedRef.current) return;
+    bootSyncedRef.current = true;
+    const start = Math.min(Math.max(0, bootIndex), images.length - 1);
+    setIdx(start);
+  }, [workspaceReady, images.length, bootIndex]);
 
   const needsStage1 = useMemo(
     () => images.some((im) => im.status === "Unseen" || im.status === "Rejected"),
@@ -52,17 +78,31 @@ export default function ReviewStage1({
     : "";
 
   const selectedTags = current?.tag || [];
+  const negativeTags = useMemo(
+    () => selectedTags.filter((t) => IMAGE_ERROR_TAGS.includes(t)),
+    [selectedTags],
+  );
+  const detailsMap = useMemo(() => parseTagDetails(current?.details), [current?.details]);
   const hasAcceptLock = selectedTags.some((t) => ACCEPT_TAGS.has(t));
   const availableTags = IMAGE_ERROR_TAGS.filter((t) => !selectedTags.includes(t));
 
   useEffect(() => {
+    setDetailTag(null);
+  }, [current?.id]);
+
+  useEffect(() => {
+    if (detailTag && !negativeTags.includes(detailTag)) setDetailTag(null);
+  }, [detailTag, negativeTags]);
+
+  useEffect(() => {
+    if (!workspaceReady) return;
     if (!needsStage1 && images.length) {
       setIdx(Math.max(0, images.length - 1));
     }
-  }, [needsStage1, images.length]);
+  }, [needsStage1, images.length, workspaceReady]);
 
   useEffect(() => {
-    if (!current || !jobId) return;
+    if (!workspaceReady || !current || !jobId) return;
     let cancelled = false;
     api<Box[]>(`/api/jobs/${jobId}/images/${current.id}/boxes`).then((b) => {
       if (!cancelled) setBoxes(b);
@@ -74,7 +114,7 @@ export default function ReviewStage1({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current?.id, jobId]);
+  }, [current?.id, jobId, workspaceReady]);
 
   useEffect(() => {
     const el = imageListRef.current?.querySelector<HTMLElement>(`[data-img-idx="${idx}"]`);
@@ -86,10 +126,10 @@ export default function ReviewStage1({
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
       const k = e.key.toLowerCase();
-      if (k === "d") {
+      if (e.key === "ArrowLeft" || k === "d") {
         e.preventDefault();
         setIdx((i) => Math.max(0, i - 1));
-      } else if (k === "f") {
+      } else if (e.key === "ArrowRight" || k === "f") {
         e.preventDefault();
         setIdx((i) => Math.min(images.length - 1, i + 1));
       }
@@ -98,13 +138,14 @@ export default function ReviewStage1({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [images.length]);
 
-  const setImageTags = async (tags: string[]) => {
-    if (!current || !canEdit) return;
+  const patchImage = async (patch: { tag?: string[]; details?: string; caption?: string }) => {
+    if (!current || !canEdit) return null;
     const updated = await api<LaImage>(`/api/images/${current.id}`, {
       method: "PATCH",
-      body: JSON.stringify({ tag: tags }),
+      body: JSON.stringify(patch),
     });
     onImagesChange((imgs) => imgs.map((im) => (im.id === updated.id ? updated : im)));
+    return updated;
   };
 
   const addImageTag = async (tag: string) => {
@@ -114,12 +155,46 @@ export default function ReviewStage1({
       return;
     }
     if (current.tag.includes(tag)) return;
-    await setImageTags([...current.tag, tag]);
+    const detailsMapNext = parseTagDetails(current.details);
+    if (detailsMapNext[tag] == null) detailsMapNext[tag] = "";
+    setDetailTag(tag);
+    await patchImage({
+      tag: [...current.tag, tag],
+      details: commitImageTagDetails(current.details, detailsMapNext),
+    });
   };
 
   const removeImageTag = async (tag: string) => {
     if (!current || !canEdit) return;
-    await setImageTags(current.tag.filter((t) => t !== tag));
+    const detailsMapNext = parseTagDetails(current.details);
+    delete detailsMapNext[tag];
+    if (detailTag === tag) setDetailTag(null);
+    await patchImage({
+      tag: current.tag.filter((t) => t !== tag),
+      details: commitImageTagDetails(current.details, detailsMapNext),
+    });
+  };
+
+  const setTagDetailLocal = (tag: string, text: string) => {
+    if (!current) return;
+    onImagesChange((imgs) =>
+      imgs.map((im) => {
+        if (im.id !== current.id) return im;
+        const map = parseTagDetails(im.details);
+        map[tag] = text;
+        const { goldenSuffix } = splitImageDetailsMeta(im.details);
+        return { ...im, details: mergeImageDetailsMeta(JSON.stringify(map), goldenSuffix) };
+      }),
+    );
+  };
+
+  const commitTagDetail = async (tag: string, text: string) => {
+    if (!current || !canEdit) return;
+    const map = parseTagDetails(current.details);
+    map[tag] = text;
+    const details = commitImageTagDetails(current.details, map);
+    onImagesChange((imgs) => imgs.map((im) => (im.id === current.id ? { ...im, details } : im)));
+    await patchImage({ details });
   };
 
   const continueS2 = async () => {
@@ -328,21 +403,46 @@ export default function ReviewStage1({
                   </div>
                 </div>
               </div>
-              <div className="anno-field" style={{ marginTop: 8 }}>
-                <label>Chi tiết tag ảnh</label>
+              <div className="review-s2-field" style={{ marginTop: 8 }}>
+                <span className="review-s2-label">Tag lỗi đã chọn</span>
+                <div className="review-s2-selected-tags pretty-scroll">
+                  {negativeTags.length === 0 && <span className="anno-muted">Chưa có tag lỗi</span>}
+                  {negativeTags.map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      className={`anno-chip ${detailTag === t ? "active" : ""}`}
+                      onClick={() => setDetailTag(detailTag === t ? null : t)}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="review-s2-field">
+                <span className="review-s2-label">
+                  Chi tiết tag{detailTag ? ` — ${detailTag}` : ""}
+                </span>
                 <textarea
                   rows={2}
-                  className="pretty-scroll review-s1-details"
+                  className={`pretty-scroll review-s2-details ${!detailTag ? "is-idle" : ""}`}
                   lang="vi"
-                  placeholder={canEdit ? "Mô tả chi tiết lỗi tag ảnh..." : "Không thể chỉnh sửa"}
-                  value={current.details || ""}
-                  disabled={!canEdit}
-                  onChange={async (e) => {
-                    const updated = await api<LaImage>(`/api/images/${current.id}`, {
-                      method: "PATCH",
-                      body: JSON.stringify({ details: e.target.value }),
-                    });
-                    onImagesChange((imgs) => imgs.map((im) => (im.id === updated.id ? updated : im)));
+                  placeholder={
+                    !detailTag
+                      ? "Chọn một tag lỗi ở trên để ghi chi tiết"
+                      : canEdit
+                        ? `Mô tả cho tag ${detailTag}...`
+                        : "Không thể chỉnh sửa"
+                  }
+                  value={detailTag ? detailsMap[detailTag] || "" : ""}
+                  disabled={!canEdit || !detailTag}
+                  onChange={(e) => {
+                    if (!detailTag) return;
+                    setTagDetailLocal(detailTag, e.target.value);
+                  }}
+                  onBlur={(e) => {
+                    if (!detailTag) return;
+                    void commitTagDetail(detailTag, e.target.value);
                   }}
                 />
               </div>

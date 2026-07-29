@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+import json
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -17,10 +18,11 @@ from app.models import (
     User,
     UserRole,
 )
-from app.schemas import AssignJobIn, AutoAssignIn, JobOut, JobStateIn
+from app.schemas import AssignJobIn, AutoAssignIn, JobOut, JobStateIn, TrackBoxesDeleteIn
 from app.services.jobs import (
     clear_job_lock,
     count_job_images,
+    last_view_order_index,
     refresh_annotator_locks,
     touch_job_lock,
     write_log,
@@ -31,6 +33,20 @@ from app.services.tasks import box_to_dict, image_to_dict, inject_golden_images
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 ERROR_IMAGE_TAGS = {"Thiếu box", "Thừa box", "Sai Caption"}
+
+
+def _box_track_id(details: str | None) -> str | None:
+    if not details or not details.strip():
+        return None
+    try:
+        o = json.loads(details)
+        if isinstance(o, dict):
+            t = o.get("_track")
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+    except json.JSONDecodeError:
+        pass
+    return None
 
 
 def _task_job_id(db: Session, job: Job) -> int:
@@ -430,12 +446,14 @@ def open_job(
         job.modifier_id = user.id
     db.commit()
     task = db.get(Task, job.task_id)
+    resume_order_index = last_view_order_index(db, job.id, user.id)
     return {
         "job": _job_out(db, job),
         "can_edit": can_edit,
         "effective_role": effective_role,
         "task_classes": (task.classes if task else []) or [],
         "min_role_to_add_class": task.min_role_to_add_class.value if task else "admin",
+        "resume_order_index": resume_order_index,
     }
 
 
@@ -493,6 +511,54 @@ def view_image(
     job.modifier_id = user.id
     db.commit()
     return {"ok": True, "job": _job_out(db, job)}
+
+
+@router.post("/{job_id}/delete-track-boxes")
+def delete_track_boxes(
+    job_id: int,
+    body: TrackBoxesDeleteIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete all boxes with the same track id from this order_index through the end of the job."""
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404)
+    can_view, can_edit = _can_edit_job(user, job, db, None)
+    if not can_view:
+        raise HTTPException(403)
+    if not can_edit:
+        raise HTTPException(403, "Job is locked or read-only")
+    track_id = (body.track_id or "").strip()
+    if not track_id:
+        raise HTTPException(400, "track_id required")
+    imgs = (
+        db.query(Image)
+        .filter(
+            Image.job_id == job_id,
+            func.coalesce(Image.order_index, 0) >= body.from_order_index,
+        )
+        .all()
+    )
+    deleted = 0
+    for img in imgs:
+        for box in list(img.boxes):
+            if _box_track_id(box.details) != track_id:
+                continue
+            write_log(
+                db,
+                actor_id=user.id,
+                action=LogAction.delete_box,
+                target_type=LogTargetType.box,
+                target_id=box.id,
+            )
+            db.delete(box)
+            deleted += 1
+    if deleted and job:
+        touch_job_lock(db, job, user.id)
+        job.modifier_id = user.id
+    db.commit()
+    return {"ok": True, "deleted": deleted}
 
 
 @router.post("/{job_id}/submit")

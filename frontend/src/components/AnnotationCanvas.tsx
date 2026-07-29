@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box as BoxType } from "../api";
 import { buildClassColorIndex, classColorForName } from "../utils/classColors";
+import { getCachedImage, preloadImageUrl } from "../utils/imagePrefetch";
 
 export type AnnotateTool = "box" | "segment" | "hand";
 
@@ -8,6 +9,8 @@ const LINE_W = 1;
 const POINT_R = 3;
 const HIT_CORNER = 8;
 const HIT_VERTEX = 8;
+/** Minimum box width/height on screen when drawing (px). */
+const MIN_BOX_PX = 4;
 
 type Pt = { x: number; y: number };
 
@@ -77,6 +80,8 @@ type GeometryPatch = { box_points?: string; segment_points?: string };
 
 type Props = {
   imageUrl: string;
+  /** When set, boxes are only drawn after this image is loaded (avoids box/image mismatch). */
+  imageId?: number;
   boxes: BoxType[];
   selectedId: number | null;
   tool: AnnotateTool;
@@ -90,11 +95,17 @@ type Props = {
   onCreateBox?: (points: string) => void;
   onCreateSegment?: (points: string) => void;
   onUpdateBox?: (id: number, patch: GeometryPatch) => void;
-  onAfterCreate?: () => void;
 };
 
-export default function AnnotationCanvas({
+export type AnnotationCanvasHandle = {
+  /** Remove last point while drawing a segment; returns true if handled. */
+  undoSegmentDraftPoint: () => boolean;
+};
+
+const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function AnnotationCanvas(
+  {
   imageUrl,
+  imageId,
   boxes,
   selectedId,
   tool,
@@ -107,11 +118,15 @@ export default function AnnotationCanvas({
   onCreateBox,
   onCreateSegment,
   onUpdateBox,
-  onAfterCreate,
-}: Props) {
+}: Props,
+  ref,
+) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const [img, setImg] = useState<HTMLImageElement | null>(null);
+  const [img, setImg] = useState<HTMLImageElement | null>(() => getCachedImage(imageUrl));
+  const [loadedImageId, setLoadedImageId] = useState<number | null>(() =>
+    getCachedImage(imageUrl) && imageId != null ? imageId : null,
+  );
   const dragRef = useRef<DragState | null>(null);
   const panRef = useRef({ x: 0, y: 0, scale: 1 });
   const segDraftRef = useRef<Pt[]>([]);
@@ -136,8 +151,24 @@ export default function AnnotationCanvas({
     orig: { xc: number; yc: number; w: number; h: number };
   } | null>(null);
   const rafDrawRef = useRef<number | null>(null);
-  const boxesRef = useRef(boxes);
-  boxesRef.current = boxes;
+  const [stackOrder, setStackOrder] = useState<number[]>([]);
+
+  const orderedBoxes = useMemo(() => {
+    const byId = new Map(boxes.map((b) => [b.id, b]));
+    const out: BoxType[] = [];
+    for (const id of stackOrder) {
+      const b = byId.get(id);
+      if (b) {
+        out.push(b);
+        byId.delete(id);
+      }
+    }
+    for (const b of byId.values()) out.push(b);
+    return out;
+  }, [boxes, stackOrder]);
+
+  const boxesRef = useRef(orderedBoxes);
+  boxesRef.current = orderedBoxes;
   const toolRef = useRef(tool);
   toolRef.current = tool;
   const hiddenRef = useRef(hiddenBoxIds);
@@ -151,19 +182,57 @@ export default function AnnotationCanvas({
     bump((n) => n + 1);
   }, []);
 
-  useEffect(() => {
-    const i = new Image();
-    i.onload = () => {
+  const applyLoadedImage = useCallback(
+    (i: HTMLImageElement) => {
       setImg(i);
-      panRef.current = { x: 0, y: 0, scale: 1 };
+      if (imageId != null) setLoadedImageId(imageId);
       segDraftRef.current = [];
       previewRef.current = null;
       segPreviewRef.current = null;
+      setStackOrder([]);
       bump((n) => n + 1);
+    },
+    [imageId],
+  );
+
+  useLayoutEffect(() => {
+    let cancelled = false;
+    const cached = getCachedImage(imageUrl);
+    if (cached) {
+      applyLoadedImage(cached);
+      return;
+    }
+    void preloadImageUrl(imageUrl)
+      .then((i) => {
+        if (!cancelled) applyLoadedImage(i);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setImg(null);
+          setLoadedImageId(null);
+        }
+      });
+    return () => {
+      cancelled = true;
     };
-    i.onerror = () => setImg(null);
-    i.src = imageUrl;
-  }, [imageUrl]);
+  }, [imageUrl, imageId, applyLoadedImage]);
+
+  useEffect(() => {
+    if (imageId == null) return;
+    if (loadedImageId === imageId) return;
+    const cached = getCachedImage(imageUrl);
+    if (cached) applyLoadedImage(cached);
+  }, [imageId, imageUrl, loadedImageId, applyLoadedImage]);
+
+  useEffect(() => {
+    const ids = boxes.map((b) => b.id);
+    setStackOrder((prev) => {
+      const kept = prev.filter((id) => ids.includes(id));
+      const missing = ids.filter((id) => !kept.includes(id));
+      if (!prev.length) return ids;
+      return [...kept, ...missing];
+    });
+  }, [boxes]);
 
   const classIndex = useMemo(() => buildClassColorIndex(classOrder), [classOrder]);
   const colorForClass = (cls: string) =>
@@ -276,12 +345,19 @@ export default function AnnotationCanvas({
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, ox, oy, img.width * scale, img.height * scale);
 
+    const boxesInSync = imageId == null || loadedImageId === imageId;
+    if (!boxesInSync) return;
+
     const skipId = draggingBoxId();
 
-    boxes.forEach((b) => {
+    orderedBoxes.forEach((b) => {
       if (b.id === skipId) return;
       if (hiddenBoxIds?.has(b.id)) return;
-      drawBoxShape(ctx, b, scale, ox, oy, b.id === selectedId);
+      const drawTool = toolRef.current;
+      const drawingOverlay = drawTool === "box" || drawTool === "segment";
+      const showSelected =
+        b.id === selectedId && !(drawingOverlay && (segDraftRef.current.length > 0 || dragRef.current?.kind === "draw"));
+      drawBoxShape(ctx, b, scale, ox, oy, showSelected);
     });
 
     const skipBox = skipId != null ? boxesRef.current.find((x) => x.id === skipId) : null;
@@ -325,7 +401,7 @@ export default function AnnotationCanvas({
     if (draft.length) {
       const stroke = draftStroke();
       ctx.strokeStyle = stroke;
-      ctx.lineWidth = LINE_W;
+      ctx.lineWidth = LINE_W + 1;
       ctx.setLineDash([]);
       ctx.beginPath();
       draft.forEach((p, i) => {
@@ -352,6 +428,7 @@ export default function AnnotationCanvas({
         const py = p.y * img.height * scale + oy;
         drawPoint(ctx, px, py, stroke);
       });
+      ctx.lineWidth = LINE_W;
     }
 
     if (toolRef.current === "box" && mouseRef.current && !dragRef.current && !readOnly) {
@@ -369,16 +446,17 @@ export default function AnnotationCanvas({
     if (dragRef.current?.kind === "draw" && previewRef.current) {
       const p = previewRef.current;
       ctx.strokeStyle = draftStroke();
-      ctx.lineWidth = LINE_W;
+      ctx.lineWidth = LINE_W + 1;
       ctx.strokeRect(
         (p.xc - p.w / 2) * img.width * scale + ox,
         (p.yc - p.h / 2) * img.height * scale + oy,
         p.w * img.width * scale,
         p.h * img.height * scale,
       );
+      ctx.lineWidth = LINE_W;
     }
   }, [
-    boxes,
+    orderedBoxes,
     img,
     selectedId,
     classOrder,
@@ -387,7 +465,13 @@ export default function AnnotationCanvas({
     readOnly,
     classIndex,
     hiddenBoxIds,
+    imageId,
+    loadedImageId,
   ]);
+
+  useEffect(() => {
+    draw();
+  }, [stackOrder, draw]);
 
   const scheduleDraw = useCallback(() => {
     if (rafDrawRef.current != null) return;
@@ -400,6 +484,16 @@ export default function AnnotationCanvas({
   useEffect(() => {
     draw();
   }, [draw]);
+
+  const prevBoxCountRef = useRef(boxes.length);
+  useEffect(() => {
+    if (boxes.length > prevBoxCountRef.current) {
+      segDraftRef.current = [];
+      previewRef.current = null;
+      draw();
+    }
+    prevBoxCountRef.current = boxes.length;
+  }, [boxes.length, draw]);
 
   useEffect(() => {
     if (tool !== "box") mouseRef.current = null;
@@ -446,12 +540,27 @@ export default function AnnotationCanvas({
     const draft = segDraftRef.current;
     if (draft.length < 3) return;
     const points = draft.map((p) => `${p.x} ${p.y}`).join(" ");
-    segDraftRef.current = [];
-    onAfterCreate?.();
     if (onCreateSegment) onCreateSegment(points);
     bump((n) => n + 1);
     draw();
-  }, [onCreateSegment, onAfterCreate, draw]);
+  }, [onCreateSegment, draw]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      undoSegmentDraftPoint: () => {
+        if (readOnly) return false;
+        if (toolRef.current !== "segment") return false;
+        const draft = segDraftRef.current;
+        if (draft.length === 0) return false;
+        segDraftRef.current = draft.slice(0, -1);
+        bump((n) => n + 1);
+        draw();
+        return true;
+      },
+    }),
+    [readOnly, draw],
+  );
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -480,20 +589,46 @@ export default function AnnotationCanvas({
     return { ix, iy, scale, ox, oy, rect, px, py };
   };
 
-  const hitTest = (ix: number, iy: number) => {
+  const boxHitsAt = (ix: number, iy: number) => {
+    const hits: number[] = [];
     const list = boxesRef.current;
     for (let i = list.length - 1; i >= 0; i--) {
       const b = list[i];
       if (isHidden(b.id)) continue;
       const segs = parseSegment(b.segment_points || "");
+      let inside = false;
       if (segs.length >= 3) {
-        if (pointInPoly(ix, iy, segs)) return b.id;
-        continue;
+        inside = pointInPoly(ix, iy, segs);
+      } else {
+        const { xc, yc, w, h } = parseBox(b.box_points);
+        inside =
+          ix >= xc - w / 2 && ix <= xc + w / 2 && iy >= yc - h / 2 && iy <= yc + h / 2;
       }
-      const { xc, yc, w, h } = parseBox(b.box_points);
-      if (ix >= xc - w / 2 && ix <= xc + w / 2 && iy >= yc - h / 2 && iy <= yc + h / 2) return b.id;
+      if (inside) hits.push(b.id);
     }
-    return null;
+    return hits;
+  };
+
+  const sendBoxToBack = (boxId: number) => {
+    setStackOrder((prev) => {
+      const rest = prev.filter((id) => id !== boxId);
+      return [boxId, ...rest];
+    });
+  };
+
+  const beginHandBoxDrag = (hit: number, ix: number, iy: number, px: number, py: number) => {
+    onSelect(hit);
+    const box = boxesRef.current.find((b) => b.id === hit)!;
+    const segs = parseSegment(box.segment_points || "");
+    pendingMoveRef.current = {
+      id: hit,
+      startIx: ix,
+      startIy: iy,
+      startPx: px,
+      startPy: py,
+      orig: parseBox(box.box_points),
+      origSegs: segs.length >= 2 ? segs.map((p) => ({ ...p })) : undefined,
+    };
   };
 
   const hitCorner = (px: number, py: number, box: BoxType): Corner | null => {
@@ -531,7 +666,8 @@ export default function AnnotationCanvas({
     if (!img) return;
     e.preventDefault();
 
-    if (e.ctrlKey && e.detail >= 2) {
+    if (e.detail >= 2) {
+      e.preventDefault();
       fitView();
       draw();
       return;
@@ -551,19 +687,23 @@ export default function AnnotationCanvas({
 
     const { ix, iy, px, py } = normFromEvent(e);
 
+    if (tool === "box") {
+      dragRef.current = { kind: "draw", x: ix, y: iy };
+      previewRef.current = { xc: ix, yc: iy, w: 0.01, h: 0.01 };
+      onSelect(null);
+      draw();
+      return;
+    }
+
     if (tool === "segment") {
-      const hit = hitTest(ix, iy);
-      if (hit && segDraftRef.current.length === 0) {
-        onSelect(hit);
-        return;
-      }
+      if (segDraftRef.current.length === 0) onSelect(null);
       segDraftRef.current = [...segDraftRef.current, { x: ix, y: iy }];
       bump((n) => n + 1);
       draw();
       return;
     }
 
-    if (tool === "hand" || tool === "box") {
+    if (tool === "hand") {
       const selected = selectedId ? boxesRef.current.find((b) => b.id === selectedId) : null;
       if (tool === "hand" && selected && !isHidden(selected.id)) {
         const segs = parseSegment(selected.segment_points || "");
@@ -594,29 +734,19 @@ export default function AnnotationCanvas({
         }
       }
 
-      const hit = hitTest(ix, iy);
-      if (hit) {
-        onSelect(hit);
-        if (tool === "hand") {
-          const box = boxesRef.current.find((b) => b.id === hit)!;
-          const segs = parseSegment(box.segment_points || "");
-          pendingMoveRef.current = {
-            id: hit,
-            startIx: ix,
-            startIy: iy,
-            startPx: px,
-            startPy: py,
-            orig: parseBox(box.box_points),
-            origSegs: segs.length >= 2 ? segs.map((p) => ({ ...p })) : undefined,
-          };
-        }
+      const hits = boxHitsAt(ix, iy);
+      if (tool === "hand" && e.shiftKey && hits.length >= 2) {
+        const topId = hits[0];
+        const nextId = hits[1];
+        sendBoxToBack(topId);
+        beginHandBoxDrag(nextId, ix, iy, px, py);
+        scheduleDraw();
         return;
       }
 
-      if (tool === "box") {
-        dragRef.current = { kind: "draw", x: ix, y: iy };
-        previewRef.current = { xc: ix, yc: iy, w: 0.01, h: 0.01 };
-        onSelect(null);
+      const hit = hits[0] ?? null;
+      if (hit) {
+        beginHandBoxDrag(hit, ix, iy, px, py);
         return;
       }
 
@@ -764,15 +894,18 @@ export default function AnnotationCanvas({
     }
 
     if (drag.kind === "draw" && onCreateBox) {
-      const { ix, iy } = normFromEvent(e);
-      const w = Math.max(0.01, Math.abs(ix - drag.x));
-      const h = Math.max(0.01, Math.abs(iy - drag.y));
-      previewRef.current = null;
-      if (w >= 0.005 && h >= 0.005) {
+      const { ix, iy, scale } = normFromEvent(e);
+      const w = Math.abs(ix - drag.x);
+      const h = Math.abs(iy - drag.y);
+      const wPx = w * img.width * scale;
+      const hPx = h * img.height * scale;
+      if (wPx >= MIN_BOX_PX && hPx >= MIN_BOX_PX) {
         const xc = (drag.x + ix) / 2;
         const yc = (drag.y + iy) / 2;
+        previewRef.current = { xc, yc, w, h };
         onCreateBox(`${xc} ${yc} ${w} ${h}`);
-        onAfterCreate?.();
+      } else {
+        previewRef.current = null;
       }
       draw();
       return;
@@ -856,17 +989,17 @@ export default function AnnotationCanvas({
           draw();
         }}
         onDoubleClick={(e) => {
-          if (e.ctrlKey) {
-            e.preventDefault();
-            fitView();
-            draw();
-          }
+          e.preventDefault();
+          fitView();
+          draw();
         }}
         style={{ cursor }}
       />
     </div>
   );
-}
+});
+
+export default AnnotationCanvas;
 
 function pointInPoly(x: number, y: number, pts: { x: number; y: number }[]) {
   let inside = false;

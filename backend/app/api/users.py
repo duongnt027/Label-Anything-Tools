@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_user, require_roles
-from app.models import Job, JobState, LogAction, LogTargetType, User, UserRole
+from app.models import Box, Image, Job, JobState, Log, LogAction, LogTargetType, Task, User, UserRole
 from app.schemas import UserCreate, UserOut, UserUpdate
 from app.security import hash_password
 from app.services.jobs import write_log
@@ -150,18 +150,58 @@ def delete_user(
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(404, "User not found")
-    active = (
+    if user.id == admin.id:
+        raise HTTPException(400, "Không thể xóa chính tài khoản đang đăng nhập")
+    first_admin = (
+        db.query(User)
+        .filter(User.role == UserRole.admin)
+        .order_by(User.id.asc())
+        .first()
+    )
+    if first_admin and first_admin.id == user.id:
+        raise HTTPException(400, "Không thể xóa admin gốc của hệ thống")
+
+    blocking = (
         db.query(Job)
         .filter(
+            Job.state.in_([JobState.in_progress, JobState.need_review]),
             (Job.assignee_id == user_id) | (Job.locked_by_id == user_id),
-            Job.state.in_(
-                [JobState.new, JobState.in_progress, JobState.need_review, JobState.rejected]
-            ),
         )
         .first()
     )
-    if active:
-        raise HTTPException(400, "User has active jobs; reassign or complete first")
+    if blocking:
+        raise HTTPException(
+            400,
+            "User đang giữ hoặc được gán job đang làm/review; gỡ gán hoặc hoàn thành job trước",
+        )
+
+    # Detach FK references so DELETE users succeeds (Postgres has no ON DELETE SET NULL on these).
+    db.query(User).filter(User.supervisor_id == user_id).update(
+        {User.supervisor_id: None}, synchronize_session=False
+    )
+    db.query(Job).filter(Job.assignee_id == user_id).update(
+        {Job.assignee_id: None}, synchronize_session=False
+    )
+    db.query(Job).filter(Job.locked_by_id == user_id).update(
+        {Job.locked_by_id: None}, synchronize_session=False
+    )
+    fallback_modifier = admin.id
+    db.query(Task).filter(Task.modifier_id == user_id).update(
+        {Task.modifier_id: fallback_modifier}, synchronize_session=False
+    )
+    db.query(Job).filter(Job.modifier_id == user_id).update(
+        {Job.modifier_id: fallback_modifier}, synchronize_session=False
+    )
+    db.query(Image).filter(Image.modifier_id == user_id).update(
+        {Image.modifier_id: fallback_modifier}, synchronize_session=False
+    )
+    db.query(Box).filter(Box.modifier_id == user_id).update(
+        {Box.modifier_id: fallback_modifier}, synchronize_session=False
+    )
+    db.query(Log).filter(Log.actor_id == user_id).update(
+        {Log.actor_id: fallback_modifier}, synchronize_session=False
+    )
+
     write_log(
         db,
         actor_id=admin.id,

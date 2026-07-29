@@ -1,0 +1,72 @@
+body {
+  font-family: "Noto Sans", "Liberation Sans", sans-serif;
+  font-size: 11pt;
+  line-height: 1.45;
+  color: #1a1a1a;
+}
+
+h1 {
+  font-size: 22pt;
+  border-bottom: 2px solid #4338ca;
+  padding-bottom: 0.35em;
+  margin-top: 0;
+}
+
+h2 {
+  font-size: 14pt;
+  margin-top: 1.4em;
+  color: #312e81;
+}
+
+h3 {
+  font-size: 12pt;
+  margin-top: 1em;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.75em 0;
+  font-size: 10pt;
+}
+
+th,
+td {
+  border: 1px solid #ccc;
+  padding: 0.35em 0.5em;
+  text-align: left;
+}
+
+th {
+  background: #f3f4f6;
+}
+
+code {
+  font-size: 0.9em;
+  background: #f3f4f6;
+  padding: 0.1em 0.25em;
+  border-radius: 3px;
+}
+
+pre {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  padding: 0.75em;
+  font-size: 9pt;
+  overflow-x: auto;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid #ddd;
+  margin: 1.5em 0;
+}
+
+a {
+  color: #4338ca;
+}

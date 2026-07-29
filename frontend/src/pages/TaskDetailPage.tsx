@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api, Job, LaImage, User } from "../api";
+import { api, apiDownloadPost, Job, LaImage, User } from "../api";
 import { AssigneeCombobox } from "../components/AssigneeCombobox";
 import { AssigneesModal } from "../components/AssigneesModal";
 import { ExportOptions, ExportOptionsModal } from "../components/ExportOptionsModal";
@@ -23,8 +23,7 @@ function formatDateTime(iso: string | undefined) {
   }
 }
 
-function downloadJson(data: unknown, filename: string) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+function downloadBlob(blob: Blob, filename: string) {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = filename;
@@ -110,44 +109,35 @@ export default function TaskDetailPage() {
   };
 
   const runExport = async (target: ExportTarget, opts: ExportOptions) => {
-    if (target.kind === "golden") {
-      const ids = [...selectedGoldenIds];
-      if (!ids.length) throw new Error("Chọn ít nhất một ảnh");
-      const data = await api(`/api/tasks/${taskId}/golden-pool/export`, {
-        method: "POST",
-        body: JSON.stringify({
-          include_images: opts.includeImages,
-          box_visibility: opts.boxVisibility,
-          image_ids: ids,
-        }),
-      });
-      downloadJson(data, `task-${taskId}-golden-pool.json`);
-      return;
-    }
-
-    const body: {
-      include_images: boolean;
-      box_visibility: string;
-      job_ids?: number[];
-    } = {
+    const payload = {
       include_images: opts.includeImages,
       box_visibility: opts.boxVisibility,
     };
-    let filename = `task-${taskId}-export.json`;
+
+    if (target.kind === "golden") {
+      const ids = [...selectedGoldenIds];
+      if (!ids.length) throw new Error("Chọn ít nhất một ảnh");
+      const { blob, filename } = await apiDownloadPost(`/api/tasks/${taskId}/golden-pool/export`, {
+        ...payload,
+        image_ids: ids,
+      });
+      downloadBlob(blob, filename ?? `task-${taskId}-golden-pool.zip`);
+      return;
+    }
+
+    let filename = `task-${taskId}-export.zip`;
+    const body: typeof payload & { job_ids?: number[] } = { ...payload };
     if (target.kind === "selected") {
       const ids = [...selectedJobIds];
       if (!ids.length) throw new Error("Chọn ít nhất một job");
       body.job_ids = ids;
-      filename = `task-${taskId}-jobs-selected.json`;
+      filename = `task-${taskId}-jobs-selected.zip`;
     } else if (target.kind === "job") {
       body.job_ids = [target.jobId];
-      filename = `task-${taskId}-job-${target.taskJobId}.json`;
+      filename = `task-${taskId}-job-${target.taskJobId}.zip`;
     }
-    const data = await api(`/api/tasks/${taskId}/export`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    downloadJson(data, filename);
+    const out = await apiDownloadPost(`/api/tasks/${taskId}/export`, body);
+    downloadBlob(out.blob, out.filename ?? filename);
   };
 
   const deleteTask = async () => {
@@ -204,6 +194,30 @@ export default function TaskDetailPage() {
       await loadGolden();
     } catch (ex) {
       alert(ex instanceof Error ? ex.message : "Xóa thất bại");
+    }
+  };
+
+  const deleteSelectedGolden = async () => {
+    const ids = [...selectedGoldenIds];
+    if (ids.length === 0) return;
+    if (
+      !confirm(
+        `Xóa ${ids.length} ảnh đã chọn khỏi golden pool? Hành động này không hoàn tác được.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await Promise.all(
+        ids.map((imageId) =>
+          api(`/api/tasks/${taskId}/golden-pool/${imageId}`, { method: "DELETE" }),
+        ),
+      );
+      setSelectedGoldenIds(new Set());
+      await loadGolden();
+    } catch (ex) {
+      alert(ex instanceof Error ? ex.message : "Xóa ảnh golden thất bại");
+      await loadGolden();
     }
   };
 
@@ -316,6 +330,14 @@ export default function TaskDetailPage() {
                       +
                     </span>
                     Import
+                  </button>
+                  <button
+                    type="button"
+                    className="task-action-btn task-action-delete task-action-export-sm"
+                    disabled={selectedGoldenIds.size === 0}
+                    onClick={deleteSelectedGolden}
+                  >
+                    Xóa đã chọn ({selectedGoldenIds.size})
                   </button>
                   <button
                     type="button"

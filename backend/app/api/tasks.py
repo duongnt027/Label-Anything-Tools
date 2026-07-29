@@ -1,8 +1,11 @@
+import copy
+import json
 import os
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -20,21 +23,52 @@ from app.models import (
     User,
     UserRole,
 )
-from app.schemas import ExportGoldenOptions, ExportOptions, TaskAssigneesIn, TaskCreate, TaskOut, UserOut
+from app.schemas import ExportGoldenOptions, ExportOptions, MountDirEntry, MountTreeOut, TaskAssigneesIn, TaskCreate, TaskOut, UserOut
 from app.api.users import _user_out
 from app.services.tasks import (
+    apply_task_json_by_filename,
     copy_images_to_golden_pool,
+    _rewrite_annotation_paths_for_renames,
     copy_images_to_task,
     ensure_storage,
-    export_golden_pool_json,
-    export_task_json,
+    export_golden_pool_zip,
+    export_task_zip,
+    extract_task_zip,
     import_task_json,
+    link_mount_images_to_task,
+    list_mount_folder_images,
     materialize_uploads,
+    mount_tree,
+    parse_annos_upload,
+    resolve_mount_dir,
     storage_path,
 )
 from app.services.jobs import count_task_images, write_log
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+
+def _folder_from_server_mount(server_folder: str) -> Path:
+    try:
+        return resolve_mount_dir(server_folder.strip())
+    except ValueError:
+        raise HTTPException(400, "Đường dẫn mount không hợp lệ")
+    except FileNotFoundError:
+        raise HTTPException(400, "Thư mục mount không tồn tại")
+
+
+def _upload_files_from_form(form) -> list[UploadFile]:
+    """Collect multipart file parts (works when File() binding misses behind some proxies)."""
+    out: list[UploadFile] = []
+    if hasattr(form, "getlist"):
+        for f in form.getlist("files"):
+            if hasattr(f, "read") and getattr(f, "filename", None):
+                out.append(f)  # type: ignore[arg-type]
+    if not out:
+        single = form.get("files")
+        if single is not None and hasattr(single, "read") and getattr(single, "filename", None):
+            out.append(single)  # type: ignore[arg-type]
+    return out
 
 
 def _task_out(db: Session, task: Task) -> TaskOut:
@@ -64,13 +98,33 @@ def list_tasks(user: User = Depends(require_roles("admin")), db: Session = Depen
     return [_task_out(db, t) for t in tasks]
 
 
+@router.get("/mount-tree", response_model=MountTreeOut)
+def browse_mount_tree(
+    path: str = "",
+    user: User = Depends(require_roles("admin")),
+):
+    del user
+    ensure_storage()
+    try:
+        current, parent, entries = mount_tree(path)
+    except ValueError:
+        raise HTTPException(400, "Đường dẫn không hợp lệ")
+    except FileNotFoundError:
+        raise HTTPException(404, "Thư mục không tồn tại")
+    return MountTreeOut(
+        path=current,
+        parent=parent,
+        entries=[MountDirEntry(**e) for e in entries],
+    )
+
+
 @router.post("", response_model=TaskOut)
 async def create_task(
     chunk_size: int = Form(50),
     name: str | None = Form(None),
     classes: str = Form(""),
     min_role_to_add_class: str = Form("admin"),
-    golden_per_job: int = Form(0),
+    golden_per_job: int = Form(2),
     server_folder: str | None = Form(None),
     files: list[UploadFile] = File(default=[]),
     user: User = Depends(require_roles("admin")),
@@ -78,22 +132,39 @@ async def create_task(
 ):
     ensure_storage()
     sources: list[tuple[str, str]] = []
+    annotation_items: list[dict] | None = None
+
     if server_folder and server_folder.strip():
-        folder = Path(server_folder.strip())
-        if not folder.is_dir():
-            folder = storage_path(server_folder.strip())
-        if not folder.is_dir():
-            raise HTTPException(400, "Thư mục mount không tồn tại")
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp", "*.gif"):
-            for p in sorted(folder.glob(ext)):
-                sources.append((str(p), p.name))
-    if files:
-        try:
-            sources.extend(await materialize_uploads(files, user.id))
-        except zipfile.BadZipFile:
-            raise HTTPException(400, "File ZIP không hợp lệ")
+        folder = _folder_from_server_mount(server_folder)
+        sources = list_mount_folder_images(folder)
+    elif files:
+        for f in files:
+            raw_name = (f.filename or "").lower()
+            content = await f.read()
+            if raw_name.endswith(".zip"):
+                try:
+                    zip_sources, ann = extract_task_zip(content, user.id)
+                except zipfile.BadZipFile:
+                    raise HTTPException(400, "File ZIP không hợp lệ")
+                except ValueError as ex:
+                    raise HTTPException(400, str(ex))
+                except json.JSONDecodeError:
+                    raise HTTPException(400, "File JSON trong ZIP không hợp lệ")
+                sources.extend(zip_sources)
+                if ann is not None:
+                    annotation_items = ann
+            else:
+                raise HTTPException(400, "Upload ZIP phải là file .zip")
+    else:
+        raise HTTPException(400, "Chọn mount folder hoặc upload ZIP")
+
     if not sources:
-        raise HTTPException(400, "Chọn mount folder hoặc upload ZIP/folder")
+        raise HTTPException(400, "Không có ảnh để tạo task")
+
+    if chunk_size < 2:
+        raise HTTPException(400, "Chunk size (ảnh / job) phải lớn hơn 1")
+    if golden_per_job < 2:
+        raise HTTPException(400, "Golden / job phải lớn hơn 1")
 
     task = Task(
         name=name or "",
@@ -107,14 +178,30 @@ async def create_task(
     db.flush()
     if not task.name:
         task.name = f"#{task.id}"
-    copy_images_to_task(db, task, sources, user.id, chunk_size)
+    try:
+        if server_folder and server_folder.strip():
+            link_mount_images_to_task(db, task, sources, user.id, chunk_size)
+        else:
+            copy_images_to_task(db, task, sources, user.id, chunk_size)
+    except FileNotFoundError as ex:
+        raise HTTPException(400, f"Không tìm thấy file ảnh: {ex}") from ex
+    except ValueError as ex:
+        raise HTTPException(400, str(ex)) from ex
+    labeled = 0
+    if annotation_items:
+        labeled = apply_task_json_by_filename(db, task, annotation_items, user.id)
+    detail = f"Created task with {len(sources)} images"
+    if server_folder and server_folder.strip():
+        detail += " (mount, no copy)"
+    if labeled:
+        detail += f", applied labels to {labeled} images from JSON"
     write_log(
         db,
         actor_id=user.id,
         action=LogAction.create_task,
         target_type=LogTargetType.task,
         target_id=task.id,
-        detail=f"Created task with {len(sources)} images",
+        detail=detail,
     )
     db.commit()
     db.refresh(task)
@@ -344,22 +431,27 @@ def export_golden_pool(
     user: User = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
+    del user
     if not db.get(Task, task_id):
         raise HTTPException(404)
-    return export_golden_pool_json(
+    data, filename = export_golden_pool_zip(
         db,
         task_id,
         box_visibility=opts.box_visibility,
         include_images=opts.include_images,
         image_ids=opts.image_ids,
     )
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/{task_id}/golden-pool/import")
 async def import_golden_pool(
     task_id: int,
-    server_folder: str | None = Form(None),
-    files: list[UploadFile] = File(default=[]),
+    request: Request,
     user: User = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
@@ -367,34 +459,76 @@ async def import_golden_pool(
     if not task:
         raise HTTPException(404)
     ensure_storage()
-    sources: list[tuple[str, str]] = []
-    if server_folder and server_folder.strip():
-        folder = Path(server_folder.strip())
-        if not folder.is_dir():
-            folder = storage_path(server_folder.strip())
-        if not folder.is_dir():
-            raise HTTPException(400, "Thư mục mount không tồn tại")
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp", "*.gif"):
-            for p in sorted(folder.glob(ext)):
-                sources.append((str(p), p.name))
-    if files:
-        try:
-            sources.extend(await materialize_uploads(files, user.id))
-        except zipfile.BadZipFile:
-            raise HTTPException(400, "File ZIP không hợp lệ")
-    if not sources:
+    form = await request.form()
+    raw_folder = form.get("server_folder")
+    server_folder = raw_folder.strip() if isinstance(raw_folder, str) and raw_folder.strip() else None
+    upload_files = _upload_files_from_form(form)
+
+    if not server_folder and not upload_files:
         raise HTTPException(400, "Chọn mount folder hoặc upload ZIP")
-    count = copy_images_to_golden_pool(db, task, sources, user.id)
+
+    sources: list[tuple[str, str]] = []
+    annotation_items: list[dict] | None = None
+
+    if server_folder:
+        folder = _folder_from_server_mount(server_folder)
+        sources = list_mount_folder_images(folder)
+
+    for f in upload_files:
+        raw_name = (f.filename or "").lower()
+        content = await f.read()
+        if raw_name.endswith(".zip"):
+            try:
+                zip_sources, ann = extract_task_zip(content, user.id)
+            except zipfile.BadZipFile:
+                raise HTTPException(400, "File ZIP không hợp lệ")
+            except ValueError as ex:
+                raise HTTPException(400, str(ex))
+            except json.JSONDecodeError:
+                raise HTTPException(400, "File JSON trong ZIP không hợp lệ")
+            sources.extend(zip_sources)
+            if ann is not None:
+                annotation_items = ann
+        else:
+            batch = await materialize_uploads([f], user.id)
+            sources.extend(batch)
+
+    if not sources:
+        if server_folder:
+            raise HTTPException(
+                400,
+                "Thư mục mount không có ảnh (chọn thư mục có file ảnh ngay trong folder, không chỉ thư mục con)",
+            )
+        raise HTTPException(
+            400,
+            "ZIP không có ảnh hợp lệ — cùng cấu trúc khi tạo task: một thư mục ảnh (cấp 1), tùy chọn một annos.json",
+        )
+
+    count, golden_lookup, rename_map = copy_images_to_golden_pool(db, task, sources, user.id)
+    labeled = 0
+    if annotation_items:
+        annos = copy.deepcopy(annotation_items)
+        _rewrite_annotation_paths_for_renames(annos, rename_map)
+        labeled = apply_task_json_by_filename(
+            db,
+            task,
+            annos,
+            user.id,
+            image_lookup=golden_lookup,
+        )
+    detail = f"Imported {count} golden images"
+    if labeled:
+        detail += f", applied labels on {labeled} images from JSON"
     write_log(
         db,
         actor_id=user.id,
         action=LogAction.add_to_golden_pool,
         target_type=LogTargetType.task,
         target_id=task.id,
-        detail=f"Imported {count} golden images",
+        detail=detail,
     )
     db.commit()
-    return {"imported": count}
+    return {"imported": count, "labeled": labeled}
 
 
 @router.post("/{task_id}/export")
@@ -404,15 +538,21 @@ def export_task(
     user: User = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
 ):
+    del user
     if not db.get(Task, task_id):
         raise HTTPException(404)
-    return export_task_json(
+    data, filename = export_task_zip(
         db,
         task_id,
         box_visibility=opts.box_visibility,
         include_images=opts.include_images,
         include_rejected=opts.include_rejected,
         job_ids=opts.job_ids,
+    )
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -425,11 +565,15 @@ async def import_task(
 ):
     if not db.get(Task, task_id):
         raise HTTPException(404)
-    import json
-
-    data = json.loads(await file.read())
-    if isinstance(data, dict):
-        data = [data]
-    count = import_task_json(db, task_id, data, user.id)
+    raw = await file.read()
+    try:
+        items = parse_annos_upload(raw, file.filename or "annos.json")
+    except zipfile.BadZipFile:
+        raise HTTPException(400, "File ZIP không hợp lệ")
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    except json.JSONDecodeError:
+        raise HTTPException(400, "annos.json không hợp lệ")
+    count = import_task_json(db, task_id, items, user.id)
     db.commit()
     return {"updated": count}

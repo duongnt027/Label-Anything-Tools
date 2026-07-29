@@ -2,6 +2,7 @@ import { FormEvent, useState } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 import { login } from "../api";
 import { useAuth } from "../auth";
+import AppLogo from "../components/AppLogo";
 
 export default function LoginPage() {
   const [username, setUsername] = useState("");
@@ -33,7 +34,10 @@ export default function LoginPage() {
   return (
     <div className="login-shell">
       <form className="login-card" onSubmit={onSubmit}>
-        <h1>Label Anything</h1>
+        <div className="login-brand">
+          <AppLogo size={56} className="login-logo" />
+          <h1>Label Anything</h1>
+        </div>
         <p className="subtitle">Sign in to start annotation workspace</p>
         <label>Username</label>
         <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" />
@@ -48,9 +52,6 @@ export default function LoginPage() {
         <button type="submit" className="topbar-btn primary" style={{ width: "100%", marginTop: "1.25rem" }}>
           Login
         </button>
-        <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "1rem" }}>
-          Mặc định: admin/1, annotator1/1, reviewer1/1
-        </p>
       </form>
     </div>
   );

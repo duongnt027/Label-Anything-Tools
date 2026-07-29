@@ -3,7 +3,7 @@ from datetime import timedelta
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Job, JobState, Log, LogAction, LogTargetType, now_gmt7
+from app.models import Image, Job, JobState, Log, LogAction, LogTargetType, now_gmt7
 
 
 def count_job_images(db: Session, job_id: int) -> int:
@@ -65,6 +65,31 @@ def write_log(
             detail=detail,
         )
     )
+
+
+def last_view_order_index(db: Session, job_id: int, user_id: int) -> int | None:
+    """Last image order_index this user viewed in the job (from view_image logs)."""
+    log = (
+        db.query(Log)
+        .filter(
+            Log.actor_id == user_id,
+            Log.action == LogAction.view_image,
+            Log.target_type == LogTargetType.job,
+            Log.target_id == job_id,
+        )
+        .order_by(Log.id.desc())
+        .first()
+    )
+    if not log or not log.detail.startswith("view image "):
+        return None
+    try:
+        image_id = int(log.detail.rsplit(" ", 1)[-1])
+    except ValueError:
+        return None
+    img = db.get(Image, image_id)
+    if not img or img.job_id != job_id or img.order_index is None:
+        return None
+    return img.order_index
 
 
 def refresh_annotator_locks(db: Session) -> None:
