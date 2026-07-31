@@ -33,6 +33,28 @@ export default function JobWorkspace() {
   const navTokenRef = useRef(0);
   const idxRef = useRef(0);
   idxRef.current = idx;
+  const viewImageTimerRef = useRef<number | null>(null);
+
+  const scheduleViewImage = useCallback(
+    (imageId: number) => {
+      if (!jobId) return;
+      if (viewImageTimerRef.current != null) window.clearTimeout(viewImageTimerRef.current);
+      viewImageTimerRef.current = window.setTimeout(() => {
+        viewImageTimerRef.current = null;
+        void api<{ job: Job }>(`/api/jobs/${jobId}/view-image/${imageId}`, { method: "POST" }).then((r) =>
+          setJob(r.job),
+        );
+      }, 450);
+    },
+    [jobId],
+  );
+
+  useEffect(
+    () => () => {
+      if (viewImageTimerRef.current != null) window.clearTimeout(viewImageTimerRef.current);
+    },
+    [],
+  );
 
   /** Footprint from DB (view_image log); null = not loaded yet. */
   const [resumeOfferIndex, setResumeOfferIndex] = useState<number | null | undefined>(undefined);
@@ -111,7 +133,7 @@ export default function JobWorkspace() {
   const prefetchAround = useCallback(
     (center: number) => {
       if (!jobId || !images.length) return;
-      for (const j of [center - 2, center - 1, center, center + 1, center + 2]) {
+      for (const j of [center - 3, center - 2, center - 1, center, center + 1, center + 2, center + 3]) {
         if (j < 0 || j >= images.length) continue;
         const im = images[j];
         prefetchJobImageBoxes(jobId, im.id, boxesCacheRef.current);
@@ -132,6 +154,17 @@ export default function JobWorkspace() {
       const im = images[next];
       if (!im || !jobId) return;
       const token = ++navTokenRef.current;
+
+      const cachedBoxes = boxesCacheRef.current.get(im.id);
+      if (cachedBoxes) {
+        if (token !== navTokenRef.current) return;
+        setBoxes(cachedBoxes);
+        setIdx(next);
+        void preloadImageId(im.id).catch(() => {});
+        scheduleViewImage(im.id);
+        return;
+      }
+
       try {
         const [boxesData] = await Promise.all([
           api<Box[]>(`/api/jobs/${jobId}/images/${im.id}/boxes`).then((b) => {
@@ -143,15 +176,13 @@ export default function JobWorkspace() {
         if (token !== navTokenRef.current) return;
         setBoxes(boxesData);
         setIdx(next);
-        api<{ job: Job }>(`/api/jobs/${jobId}/view-image/${im.id}`, { method: "POST" }).then((r) =>
-          setJob(r.job),
-        );
+        scheduleViewImage(im.id);
       } catch {
         if (token !== navTokenRef.current) return;
         setIdx(next);
       }
     },
-    [images, jobId],
+    [images, jobId, scheduleViewImage],
   );
 
   useEffect(() => {
@@ -312,12 +343,13 @@ export default function JobWorkspace() {
         onTaskClassesChange={setTaskClasses}
         canEdit={canEdit}
         lockedByUsername={lockName}
-        showSubmit={Boolean(isAnnotatorWorkspace && user?.role === "annotator")}
+        showSubmit={Boolean(isAnnotatorWorkspace && (user?.role === "annotator" || user?.role === "admin"))}
         submitEnabled={canEdit}
         onSubmit={submitJob}
         onBack={leaveBack}
         onImagesChange={(fn) => setImages(fn)}
         showGoldenToggle={user?.role === "admin"}
+        showSlideshowToggle={user?.role === "admin" || user?.role === "reviewer"}
         headerAfterProgress={jobId ? <AdminViewSwitcher jobId={jobId} current="annotator" /> : null}
       />
     </>

@@ -22,6 +22,12 @@ export function boxGeometry(b: Box): BoxGeometry {
   return { box_points: b.box_points, segment_points: b.segment_points || "" };
 }
 
+/** True when the annotation has a closed segment polygon (not a plain box). */
+export function isSegmentAnnotation(b: { segment_points?: string | null }): boolean {
+  const parts = (b.segment_points || "").trim().split(/\s+/).filter((n) => n.length > 0);
+  return parts.length >= 4;
+}
+
 let optimisticSeq = 0;
 
 /** Placeholder box shown until POST /boxes returns (avoids canvas flicker). */

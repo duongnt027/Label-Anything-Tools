@@ -1,9 +1,11 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box as BoxType } from "../api";
+import { isSegmentAnnotation } from "../utils/boxPayload";
 import { buildClassColorIndex, classColorForName } from "../utils/classColors";
 import { getCachedImage, preloadImageUrl } from "../utils/imagePrefetch";
 
 export type AnnotateTool = "box" | "segment" | "hand";
+export type ShapeFilter = "all" | "box" | "segment";
 
 const LINE_W = 1;
 const POINT_R = 3;
@@ -91,6 +93,14 @@ type Props = {
   /** When set, all boxes/segments use this stroke color (review stage 1). */
   uniformStrokeColor?: string;
   hiddenBoxIds?: ReadonlySet<number>;
+  /** When set, only matching shapes are drawn / hit-tested. */
+  shapeFilter?: ShapeFilter;
+  /** Hand-tool edits box rect or segment polygon when both exist. */
+  interactionTarget?: "auto" | "box" | "segment";
+  /** When true, pan/zoom via drag or wheel is disabled (geometry edit only). */
+  disablePan?: boolean;
+  /** When set, initial view zooms to this normalized viewport (xc, yc, w, h). */
+  cropView?: { xc: number; yc: number; w: number; h: number };
   onSelect: (id: number | null) => void;
   onCreateBox?: (points: string) => void;
   onCreateSegment?: (points: string) => void;
@@ -114,6 +124,10 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
   defaultClass,
   uniformStrokeColor,
   hiddenBoxIds,
+  shapeFilter = "all",
+  interactionTarget = "auto",
+  disablePan,
+  cropView,
   onSelect,
   onCreateBox,
   onCreateSegment,
@@ -171,16 +185,58 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
   boxesRef.current = orderedBoxes;
   const toolRef = useRef(tool);
   toolRef.current = tool;
+  const shapeFilterRef = useRef(shapeFilter);
+  shapeFilterRef.current = shapeFilter;
+  const interactionTargetRef = useRef(interactionTarget);
+  interactionTargetRef.current = interactionTarget;
   const hiddenRef = useRef(hiddenBoxIds);
+
+  const shapeVisible = useCallback((b: BoxType) => {
+    const f = shapeFilterRef.current;
+    if (f === "all") return true;
+    const seg = isSegmentAnnotation(b);
+    return f === "segment" ? seg : !seg;
+  }, []);
   hiddenRef.current = hiddenBoxIds;
   const [, bump] = useState(0);
 
   const isHidden = (id: number) => Boolean(hiddenRef.current?.has(id));
 
+  const cropViewRef = useRef(cropView);
+  cropViewRef.current = cropView;
+
   const fitView = useCallback(() => {
     panRef.current = { x: 0, y: 0, scale: 1 };
     bump((n) => n + 1);
   }, []);
+
+  const fitCropView = useCallback(() => {
+    const view = cropViewRef.current;
+    const wrap = wrapRef.current;
+    if (!img || !wrap || !view) {
+      fitView();
+      return;
+    }
+    const rect = wrap.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const base = Math.min(rect.width / img.width, rect.height / img.height);
+    const cropScale = Math.min(
+      rect.width / (view.w * img.width),
+      rect.height / (view.h * img.height),
+    );
+    panRef.current.scale = cropScale / base;
+    const s = base * panRef.current.scale;
+    panRef.current.x =
+      rect.width / 2 - view.xc * img.width * s - (rect.width - img.width * s) / 2;
+    panRef.current.y =
+      rect.height / 2 - view.yc * img.height * s - (rect.height - img.height * s) / 2;
+    bump((n) => n + 1);
+  }, [img, fitView]);
+
+  const resetView = useCallback(() => {
+    if (cropViewRef.current) fitCropView();
+    else fitView();
+  }, [fitCropView, fitView]);
 
   const applyLoadedImage = useCallback(
     (i: HTMLImageElement) => {
@@ -233,6 +289,11 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
       return [...kept, ...missing];
     });
   }, [boxes]);
+
+  useLayoutEffect(() => {
+    if (!img) return;
+    resetView();
+  }, [img, cropView, resetView]);
 
   const classIndex = useMemo(() => buildClassColorIndex(classOrder), [classOrder]);
   const colorForClass = (cls: string) =>
@@ -353,6 +414,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
     orderedBoxes.forEach((b) => {
       if (b.id === skipId) return;
       if (hiddenBoxIds?.has(b.id)) return;
+      if (!shapeVisible(b)) return;
       const drawTool = toolRef.current;
       const drawingOverlay = drawTool === "box" || drawTool === "segment";
       const showSelected =
@@ -465,6 +527,8 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
     readOnly,
     classIndex,
     hiddenBoxIds,
+    shapeFilter,
+    shapeVisible,
     imageId,
     loadedImageId,
   ]);
@@ -507,16 +571,19 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const ro = new ResizeObserver(() => draw());
+    const ro = new ResizeObserver(() => {
+      if (cropViewRef.current) fitCropView();
+      draw();
+    });
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [draw]);
+  }, [draw, fitCropView]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
     const onWheel = (e: WheelEvent) => {
-      if (!img) return;
+      if (!img || disablePan) return;
       e.preventDefault();
       const { rect, scale, ox, oy } = viewTransform();
       const mx = e.clientX - rect.left;
@@ -534,7 +601,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
     };
     wrap.addEventListener("wheel", onWheel, { passive: false });
     return () => wrap.removeEventListener("wheel", onWheel);
-  }, [img, draw, viewTransform]);
+  }, [img, draw, viewTransform, disablePan]);
 
   const finishSegment = useCallback(() => {
     const draft = segDraftRef.current;
@@ -595,9 +662,14 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
     for (let i = list.length - 1; i >= 0; i--) {
       const b = list[i];
       if (isHidden(b.id)) continue;
+      if (!shapeVisible(b)) continue;
       const segs = parseSegment(b.segment_points || "");
+      const target = interactionTargetRef.current;
+      const useSegment =
+        segs.length >= 3 &&
+        (target === "segment" || (target === "auto" && isSegmentAnnotation(b)));
       let inside = false;
-      if (segs.length >= 3) {
+      if (useSegment) {
         inside = pointInPoly(ix, iy, segs);
       } else {
         const { xc, yc, w, h } = parseBox(b.box_points);
@@ -619,7 +691,11 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
   const beginHandBoxDrag = (hit: number, ix: number, iy: number, px: number, py: number) => {
     onSelect(hit);
     const box = boxesRef.current.find((b) => b.id === hit)!;
+    const target = interactionTargetRef.current;
     const segs = parseSegment(box.segment_points || "");
+    const useSeg =
+      segs.length >= 2 &&
+      (target === "segment" || (target === "auto" && isSegmentAnnotation(box)));
     pendingMoveRef.current = {
       id: hit,
       startIx: ix,
@@ -627,7 +703,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
       startPx: px,
       startPy: py,
       orig: parseBox(box.box_points),
-      origSegs: segs.length >= 2 ? segs.map((p) => ({ ...p })) : undefined,
+      origSegs: useSeg ? segs.map((p) => ({ ...p })) : undefined,
     };
   };
 
@@ -668,19 +744,19 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
 
     if (e.detail >= 2) {
       e.preventDefault();
-      fitView();
+      resetView();
       draw();
       return;
     }
 
     if (readOnly) {
-      if (e.ctrlKey || tool === "hand") {
+      if (!disablePan && (e.ctrlKey || tool === "hand")) {
         dragRef.current = { kind: "pan", x: e.clientX, y: e.clientY };
       }
       return;
     }
 
-    if (e.ctrlKey) {
+    if (!disablePan && e.ctrlKey) {
       dragRef.current = { kind: "pan", x: e.clientX, y: e.clientY };
       return;
     }
@@ -706,8 +782,12 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
     if (tool === "hand") {
       const selected = selectedId ? boxesRef.current.find((b) => b.id === selectedId) : null;
       if (tool === "hand" && selected && !isHidden(selected.id)) {
+        const target = interactionTargetRef.current;
         const segs = parseSegment(selected.segment_points || "");
-        if (segs.length >= 2) {
+        const useSegmentVerts =
+          segs.length >= 2 &&
+          (target === "segment" || (target === "auto" && isSegmentAnnotation(selected)));
+        if (useSegmentVerts) {
           const vi = hitVertex(px, py, segs);
           if (vi != null) {
             dragRef.current = {
@@ -990,7 +1070,7 @@ const AnnotationCanvas = forwardRef<AnnotationCanvasHandle, Props>(function Anno
         }}
         onDoubleClick={(e) => {
           e.preventDefault();
-          fitView();
+          resetView();
           draw();
         }}
         style={{ cursor }}

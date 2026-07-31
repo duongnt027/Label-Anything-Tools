@@ -2,6 +2,24 @@ import { imageUrl } from "../api";
 
 const imagePromises = new Map<string, Promise<HTMLImageElement>>();
 const imageResolved = new Map<string, HTMLImageElement>();
+const imageResolvedOrder: string[] = [];
+
+const MAX_RESOLVED_IMAGES = 48;
+
+function rememberResolved(url: string, img: HTMLImageElement) {
+  if (imageResolved.has(url)) {
+    const i = imageResolvedOrder.indexOf(url);
+    if (i >= 0) imageResolvedOrder.splice(i, 1);
+  } else if (imageResolvedOrder.length >= MAX_RESOLVED_IMAGES) {
+    const evict = imageResolvedOrder.shift();
+    if (evict) {
+      imageResolved.delete(evict);
+      imagePromises.delete(evict);
+    }
+  }
+  imageResolved.set(url, img);
+  imageResolvedOrder.push(url);
+}
 
 export function getCachedImage(url: string): HTMLImageElement | null {
   return imageResolved.get(url) ?? null;
@@ -15,7 +33,7 @@ export function preloadImageUrl(url: string): Promise<HTMLImageElement> {
     p = new Promise((resolve, reject) => {
       const i = new Image();
       i.onload = () => {
-        imageResolved.set(url, i);
+        rememberResolved(url, i);
         imagePromises.delete(url);
         resolve(i);
       };

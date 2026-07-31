@@ -1,6 +1,13 @@
-import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, Box, imageUrl, Job, LaImage } from "../api";
-import AnnotationCanvas from "../components/AnnotationCanvas";
+import AnnotationCanvas, { AnnotateTool, ShapeFilter } from "../components/AnnotationCanvas";
+import { AnnoSlideshowToggle } from "../components/AnnoSlideshowToggle";
+import { AnnoImageListItem } from "../components/AnnoImageListItem";
+import { IconBox, IconHand, IconSegment } from "../components/icons";
+import { useAuth } from "../auth";
+import { useImageSlideshow } from "../hooks/useImageSlideshow";
+import { BoxesCache, prefetchJobImageBoxes } from "../utils/boxesCache";
+import { preloadImageId } from "../utils/imagePrefetch";
 import {
   commitImageTagDetails,
   mergeImageDetailsMeta,
@@ -43,12 +50,53 @@ export default function ReviewStage1({
   bootIndex = 0,
   workspaceReady = true,
 }: Props) {
+  const { user } = useAuth();
+  const showSlideshowToggle = user?.role === "admin" || user?.role === "reviewer";
   const [idx, setIdx] = useState(0);
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [busy, setBusy] = useState(false);
   const [detailTag, setDetailTag] = useState<string | null>(null);
+  const [viewTool, setViewTool] = useState<AnnotateTool>("hand");
   const imageListRef = useRef<HTMLDivElement>(null);
   const bootSyncedRef = useRef(false);
+  const idxRef = useRef(0);
+  idxRef.current = idx;
+  const slideshowToggleRef = useRef<() => void>(() => {});
+  const boxesCacheRef = useRef<BoxesCache>(new Map());
+  const boxesFetchGenRef = useRef(0);
+  const viewImageTimerRef = useRef<number | null>(null);
+
+  const scheduleViewImage = useCallback(
+    (imageId: number) => {
+      if (!jobId) return;
+      if (viewImageTimerRef.current != null) window.clearTimeout(viewImageTimerRef.current);
+      viewImageTimerRef.current = window.setTimeout(() => {
+        viewImageTimerRef.current = null;
+        void api<{ job: Job }>(`/api/jobs/${jobId}/view-image/${imageId}`, { method: "POST" }).then((r) =>
+          onJobChange(r.job),
+        );
+      }, 450);
+    },
+    [jobId, onJobChange],
+  );
+
+  const getSlideshowIdx = useCallback(() => idxRef.current, []);
+  const slideshowNext = useCallback(async () => {
+    const next = Math.min(images.length - 1, idxRef.current + 1);
+    if (next === idxRef.current) return;
+    const im = images[next];
+    if (im && jobId) {
+      prefetchJobImageBoxes(jobId, im.id, boxesCacheRef.current);
+      void preloadImageId(im.id).catch(() => {});
+      const cached = boxesCacheRef.current.get(im.id);
+      if (cached) setBoxes(cached);
+    }
+    setIdx(next);
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+  }, [images, jobId]);
+  const { playing: slideshowPlaying, toggle: toggleSlideshow, speed: slideshowSpeed, cycleSpeed: cycleSlideshowSpeed } =
+    useImageSlideshow(images.length, getSlideshowIdx, slideshowNext);
+  slideshowToggleRef.current = toggleSlideshow;
 
   useEffect(() => {
     if (!workspaceReady) bootSyncedRef.current = false;
@@ -77,6 +125,9 @@ export default function ReviewStage1({
     ? current.filename || current.image_source.split("/").pop() || `image-${current.id}`
     : "";
 
+  const shapeFilter: ShapeFilter =
+    viewTool === "box" ? "box" : viewTool === "segment" ? "segment" : "all";
+
   const selectedTags = current?.tag || [];
   const negativeTags = useMemo(
     () => selectedTags.filter((t) => IMAGE_ERROR_TAGS.includes(t)),
@@ -103,29 +154,42 @@ export default function ReviewStage1({
 
   useEffect(() => {
     if (!workspaceReady || !current || !jobId) return;
-    let cancelled = false;
-    api<Box[]>(`/api/jobs/${jobId}/images/${current.id}/boxes`).then((b) => {
-      if (!cancelled) setBoxes(b);
-    });
-    api<{ job: Job }>(`/api/jobs/${jobId}/view-image/${current.id}`, { method: "POST" }).then((r) => {
-      if (!cancelled) onJobChange(r.job);
-    });
-    return () => {
-      cancelled = true;
-    };
+    const gen = ++boxesFetchGenRef.current;
+    const cached = boxesCacheRef.current.get(current.id);
+    if (cached) setBoxes(cached);
+    else {
+      void api<Box[]>(`/api/jobs/${jobId}/images/${current.id}/boxes`).then((b) => {
+        if (gen !== boxesFetchGenRef.current) return;
+        boxesCacheRef.current.set(current.id, b);
+        setBoxes(b);
+      });
+    }
+    scheduleViewImage(current.id);
+    void preloadImageId(current.id).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id, jobId, workspaceReady]);
 
   useEffect(() => {
     const el = imageListRef.current?.querySelector<HTMLElement>(`[data-img-idx="${idx}"]`);
-    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [idx]);
+    el?.scrollIntoView({ block: "nearest", behavior: slideshowPlaying ? "instant" : "smooth" });
+  }, [idx, slideshowPlaying]);
+
+  useEffect(() => {
+    return () => {
+      if (viewImageTimerRef.current != null) window.clearTimeout(viewImageTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
       const k = e.key.toLowerCase();
+      if (e.code === "Space" || e.key === " ") {
+        e.preventDefault();
+        slideshowToggleRef.current();
+        return;
+      }
       if (e.key === "ArrowLeft" || k === "d") {
         e.preventDefault();
         setIdx((i) => Math.max(0, i - 1));
@@ -295,29 +359,30 @@ export default function ReviewStage1({
 
       <div className="annotate-grid review-s1-grid">
         <aside className="annotate-panel left">
-          <div className="panel-section-title">Images</div>
+          <div className="anno-image-sidebar-head">
+            {showSlideshowToggle ? (
+              <AnnoSlideshowToggle
+                playing={slideshowPlaying}
+                speed={slideshowSpeed}
+                onToggle={toggleSlideshow}
+                onCycleSpeed={cycleSlideshowSpeed}
+                disabled={images.length <= 1}
+              />
+            ) : null}
+            <div className="panel-section-title">Images</div>
+          </div>
           <div className="anno-image-list pretty-scroll" ref={imageListRef}>
             {images.map((im, i) => {
               const name = im.filename || im.image_source.split("/").pop() || `image-${im.id}`;
               return (
-                <button
+                <AnnoImageListItem
                   key={im.id}
-                  type="button"
-                  data-img-idx={i}
-                  className={`anno-image-row ${i === idx ? "active" : ""}`}
+                  index={i}
+                  name={name}
+                  status={im.status}
+                  active={i === idx}
                   onClick={() => setIdx(i)}
-                >
-                  <span
-                    className={`dot ${
-                      im.status === "Accepted"
-                        ? "accepted"
-                        : im.status === "Rejected"
-                          ? "rejected"
-                          : "unseen"
-                    }`}
-                  />
-                  <span className="anno-image-row-name">{name}</span>
-                </button>
+                />
               );
             })}
           </div>
@@ -331,10 +396,37 @@ export default function ReviewStage1({
               selectedId={null}
               tool="hand"
               readOnly
+              shapeFilter={shapeFilter}
               classOrder={[]}
               uniformStrokeColor={UNIFORM_STROKE}
               onSelect={() => {}}
             />
+            <div className="anno-float-tools review-s1-view-tools">
+              <button
+                type="button"
+                className={`anno-float-btn ${viewTool === "box" ? "active" : ""}`}
+                onClick={() => setViewTool("box")}
+                title="Chỉ hiển thị box"
+              >
+                <IconBox size={14} />
+              </button>
+              <button
+                type="button"
+                className={`anno-float-btn ${viewTool === "segment" ? "active" : ""}`}
+                onClick={() => setViewTool("segment")}
+                title="Chỉ hiển thị segment"
+              >
+                <IconSegment size={14} />
+              </button>
+              <button
+                type="button"
+                className={`anno-float-btn ${viewTool === "hand" ? "active" : ""}`}
+                onClick={() => setViewTool("hand")}
+                title="Hiển thị tất cả — kéo pan ảnh"
+              >
+                <IconHand size={14} />
+              </button>
+            </div>
           </div>
           <footer className="review-s1-footer">
             <div className="anno-field">

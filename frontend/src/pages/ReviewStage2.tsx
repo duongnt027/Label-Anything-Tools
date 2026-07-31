@@ -1,9 +1,11 @@
 import { CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, Box, imageUrl, Job } from "../api";
+import AnnotationCanvas from "../components/AnnotationCanvas";
 import { useAuth } from "../auth";
 import AdminViewSwitcher from "../components/AdminViewSwitcher";
 import { unlockJobOnLeave } from "../utils/jobLock";
+import { isSegmentAnnotation } from "../utils/boxPayload";
 import { parseTagDetails, serializeTagDetails } from "../utils/tagDetails";
 
 type Stage2Box = Box & { image_source: string; img_id?: number };
@@ -102,6 +104,8 @@ export default function ReviewStage2() {
   const [boxes, setBoxes] = useState<Stage2Box[]>([]);
   const [busy, setBusy] = useState(false);
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  /** Which box has geometry handles focused in the expanded crop canvas. */
+  const [shapeFocusId, setShapeFocusId] = useState<number | null>(null);
   /** Which selected tag's detail is being edited (within the expanded box). */
   const [detailTag, setDetailTag] = useState<string | null>(null);
 
@@ -171,6 +175,7 @@ export default function ReviewStage2() {
     setBoxes((prev) => prev.filter((b) => b.id !== id));
     if (selectedId === id) {
       setSelectedId(null);
+      setShapeFocusId(null);
       setDetailTag(null);
     }
   };
@@ -178,11 +183,25 @@ export default function ReviewStage2() {
   const selectBox = (id: number) => {
     if (selectedId === id) {
       setSelectedId(null);
+      setShapeFocusId(null);
       setDetailTag(null);
       return;
     }
     setSelectedId(id);
+    setShapeFocusId(id);
     setDetailTag(null);
+  };
+
+  const handleCropSelect = (boxId: number, id: number | null) => {
+    if (id !== null) {
+      setShapeFocusId(id);
+      return;
+    }
+    if (shapeFocusId === boxId) {
+      setShapeFocusId(null);
+      return;
+    }
+    selectBox(boxId);
   };
 
   const toggleBoxTag = async (b: Stage2Box, tag: string) => {
@@ -276,7 +295,7 @@ export default function ReviewStage2() {
 
       <div className="review-s2-meta">
         {canEdit
-          ? "Chỉ ảnh đã Accept S1 mới hiện ở đây. Click crop để mở review; mỗi tag có ô mô tả riêng."
+          ? "Chỉ ảnh đã Accept S1 mới hiện ở đây. Click crop để mở review; kéo box/segment trực tiếp trên ảnh."
           : "Chế độ chỉ xem — không thể gắn tag hay kết thúc job."}
       </div>
 
@@ -285,7 +304,7 @@ export default function ReviewStage2() {
           <summary>
             <b>{cls}</b>
             <span className="review-s2-section-count">
-              {list.length} box · {list.filter((b) => b.status !== "Unseen").length} đã quyết
+              {list.length} annotation · {list.filter((b) => b.status !== "Unseen").length} đã quyết
             </span>
           </summary>
           <div className="review-s2-grid">
@@ -295,6 +314,7 @@ export default function ReviewStage2() {
               const style = cropStyle(b.box_points || "0.5 0.5 0.1 0.1");
               const expanded = selectedId === b.id;
               const detailsMap = parseTagDetails(b.details);
+              const cropView = paddedView(b.box_points);
               return (
                 <div
                   key={b.id}
@@ -302,44 +322,121 @@ export default function ReviewStage2() {
                     b.status === "Accepted" ? "accepted" : b.status === "Rejected" ? "rejected" : ""
                   }`}
                 >
-                  <button
-                    type="button"
-                    className="review-s2-crop"
-                    style={{
-                      backgroundImage: `url('${src}')`,
-                      backgroundRepeat: "no-repeat",
-                      ...style,
-                    }}
-                    title={`box #${b.id} — click để ${expanded ? "thu gọn" : "review"}`}
-                    onClick={() => selectBox(b.id)}
-                  >
-                    <BoxOverlay
-                      box_points={b.box_points}
-                      segment_points={b.segment_points}
-                      compact={!expanded}
-                    />
-                    {!expanded && b.tag.length > 0 && (
-                      <span className="review-s2-compact-badge">{b.tag.length}</span>
-                    )}
-                  </button>
+                  {!expanded ? (
+                    <button
+                      type="button"
+                      className="review-s2-crop"
+                      style={{
+                        backgroundImage: `url('${src}')`,
+                        backgroundRepeat: "no-repeat",
+                        ...style,
+                      }}
+                      title={`box #${b.id} — click để review`}
+                      onClick={() => selectBox(b.id)}
+                    >
+                      <BoxOverlay
+                        box_points={b.box_points}
+                        segment_points={b.segment_points}
+                        compact
+                      />
+                      {b.tag.length > 0 && (
+                        <span className="review-s2-compact-badge">{b.tag.length}</span>
+                      )}
+                    </button>
+                  ) : canEdit ? (
+                    <div className="review-s2-crop review-s2-crop-editable">
+                      <button
+                        type="button"
+                        className="review-s2-crop-collapse"
+                        title="Thu gọn"
+                        onClick={() => selectBox(b.id)}
+                      >
+                        ×
+                      </button>
+                      <AnnotationCanvas
+                        imageUrl={src}
+                        imageId={imgId}
+                        boxes={[b]}
+                        selectedId={shapeFocusId === b.id ? b.id : null}
+                        tool="hand"
+                        disablePan
+                        cropView={cropView}
+                        interactionTarget="auto"
+                        onSelect={(id) => handleCropSelect(b.id, id)}
+                        onUpdateBox={(id, patch) => {
+                          void patchBox(id, patch);
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <div
+                      className="review-s2-crop review-s2-crop-readonly"
+                      style={{
+                        backgroundImage: `url('${src}')`,
+                        backgroundRepeat: "no-repeat",
+                        ...style,
+                      }}
+                      title={`box #${b.id}`}
+                    >
+                      <button
+                        type="button"
+                        className="review-s2-crop-collapse"
+                        title="Thu gọn"
+                        onClick={() => selectBox(b.id)}
+                      >
+                        ×
+                      </button>
+                      <BoxOverlay
+                        box_points={b.box_points}
+                        segment_points={b.segment_points}
+                        compact={false}
+                      />
+                    </div>
+                  )}
 
                   {expanded && (
                     <div className="review-s2-expand">
                       <div className="review-s2-field">
-                        <span className="review-s2-label">OCR</span>
-                        <div
-                          className={`review-s2-value pretty-scroll ${b.ocr_text?.trim() ? "" : "is-placeholder"}`}
-                        >
-                          {b.ocr_text?.trim() || "Không có OCR"}
+                        <span className="review-s2-label">Loại</span>
+                        <div className="review-s2-value">
+                          {isSegmentAnnotation(b) ? "Segment" : "Box"}
                         </div>
                       </div>
                       <div className="review-s2-field">
+                        <span className="review-s2-label">OCR</span>
+                        <textarea
+                          rows={2}
+                          className="pretty-scroll review-s2-value-input"
+                          lang="vi"
+                          value={b.ocr_text || ""}
+                          placeholder="Không có OCR"
+                          disabled={!canEdit}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setBoxes((prev) =>
+                              prev.map((x) => (x.id === b.id ? { ...x, ocr_text: v } : x)),
+                            );
+                          }}
+                          onBlur={(e) => void patchBox(b.id, { ocr_text: e.target.value })}
+                        />
+                      </div>
+                      <div className="review-s2-field">
                         <span className="review-s2-label">Caption</span>
-                        <div
-                          className={`review-s2-value pretty-scroll ${b.caption?.trim() ? "" : "is-placeholder"}`}
-                        >
-                          {b.caption?.trim() || "Không có caption"}
-                        </div>
+                        <textarea
+                          rows={2}
+                          className="pretty-scroll review-s2-value-input"
+                          lang="vi"
+                          value={b.caption || ""}
+                          placeholder="Không có caption"
+                          disabled={!canEdit}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setBoxes((prev) =>
+                              prev.map((x) => (x.id === b.id ? { ...x, caption: v } : x)),
+                            );
+                          }}
+                          onBlur={(e) => void patchBox(b.id, { caption: e.target.value })}
+                        />
                       </div>
                       <div className="review-s2-opts pretty-scroll">
                         {BOX_TAGS.map((t) => (

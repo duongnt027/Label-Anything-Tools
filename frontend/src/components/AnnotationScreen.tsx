@@ -5,7 +5,11 @@ import AnnotationCanvas, { AnnotateTool, AnnotationCanvasHandle } from "./Annota
 import { ClassCombobox } from "./ClassCombobox";
 import { ColoredOutlineChip } from "./ColoredOutlineChip";
 import { IconBox, IconDiamond, IconEye, IconEyeOff, IconHand, IconSegment } from "./icons";
-import { boxCreatePayload, boxGeometry, cloneBox, makeOptimisticBox } from "../utils/boxPayload";
+import { AnnoSlideshowToggle } from "./AnnoSlideshowToggle";
+import { AnnoImageListItem } from "./AnnoImageListItem";
+import { useImageSlideshow } from "../hooks/useImageSlideshow";
+import { boxCreatePayload, boxGeometry, cloneBox, isSegmentAnnotation, makeOptimisticBox } from "../utils/boxPayload";
+import { AnnoShapeList } from "./AnnoShapeList";
 import { buildClassColorIndex, classColorForName } from "../utils/classColors";
 import { parseTagDetails } from "../utils/tagDetails";
 import { getBoxTrackId, withBoxTrackMeta } from "../utils/boxTrack";
@@ -22,7 +26,7 @@ type Props = {
   mode: "job" | "golden";
   images: LaImage[];
   idx: number;
-  onIdxChange: (i: number) => void;
+  onIdxChange: (i: number) => void | Promise<void>;
   /** Warm cache for a target index before navigation finishes (optional). */
   onPrefetchIndex?: (i: number) => void;
   boxes: Box[];
@@ -45,6 +49,8 @@ type Props = {
   showGoldenToggle?: boolean;
   /** Rendered in topbar after the progress bar (e.g. admin view switcher). */
   headerAfterProgress?: ReactNode;
+  /** Slideshow play/pause — admin/reviewer only. */
+  showSlideshowToggle?: boolean;
   jobId?: string | number;
   onTrackBoxesInvalidate?: (imageIds: number[]) => void;
   onTrackBoxCreated?: (imageId: number, box: Box) => void;
@@ -76,6 +82,7 @@ export default function AnnotationScreen({
   onImagesChange,
   showGoldenToggle,
   headerAfterProgress,
+  showSlideshowToggle = false,
   jobId,
   onTrackBoxesInvalidate,
   onTrackBoxCreated,
@@ -108,6 +115,7 @@ export default function AnnotationScreen({
 
   const imageListRef = useRef<HTMLDivElement>(null);
   const boxListRef = useRef<HTMLDivElement>(null);
+  const segmentListRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<AnnotationCanvasHandle>(null);
   const imageCaptionRef = useRef<HTMLTextAreaElement>(null);
   const boxCaptionRef = useRef<HTMLTextAreaElement>(null);
@@ -121,7 +129,7 @@ export default function AnnotationScreen({
   const undoStackRef = useRef<HistoryRecord[]>([]);
   const redoStackRef = useRef<HistoryRecord[]>([]);
   const flushSaveRef = useRef<() => Promise<boolean>>(async () => true);
-  const goToIndexRef = useRef<(next: number) => void>(() => {});
+  const goToIndexRef = useRef<(next: number) => Promise<void>>(async () => {});
   const prefetchIndexRef = useRef<(i: number) => void | undefined>(undefined);
   prefetchIndexRef.current = onPrefetchIndex;
   const hotkeyRef = useRef({
@@ -131,6 +139,7 @@ export default function AnnotationScreen({
     isReview: false,
     selectedBox: null as number | null,
   });
+  const slideshowToggleRef = useRef<() => void>(() => {});
 
   const fileName = current
     ? current.filename || current.image_source.split("/").pop() || `image-${current.id}`
@@ -141,6 +150,30 @@ export default function AnnotationScreen({
   const submitLit = Boolean(showSubmit && onLastImage && submitEnabled !== false && canEdit);
 
   const selected = boxes.find((b) => b.id === selectedBox) || null;
+
+  const plainBoxes = useMemo(() => boxes.filter((b) => !isSegmentAnnotation(b)), [boxes]);
+  const segmentBoxes = useMemo(() => boxes.filter((b) => isSegmentAnnotation(b)), [boxes]);
+  const hiddenPlainCount = useMemo(
+    () => plainBoxes.filter((b) => hiddenBoxIds.has(b.id)).length,
+    [plainBoxes, hiddenBoxIds],
+  );
+  const hiddenSegmentCount = useMemo(
+    () => segmentBoxes.filter((b) => hiddenBoxIds.has(b.id)).length,
+    [segmentBoxes, hiddenBoxIds],
+  );
+  const allPlainHidden = plainBoxes.length > 0 && hiddenPlainCount === plainBoxes.length;
+  const allSegmentsHidden = segmentBoxes.length > 0 && hiddenSegmentCount === segmentBoxes.length;
+
+  const toggleListVisible = (ids: number[], hide: boolean) => {
+    setHiddenBoxIds((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (hide) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
 
   useEffect(() => {
     setImageCaptionDraft(current?.caption || "");
@@ -165,8 +198,6 @@ export default function AnnotationScreen({
 
   imageIdRef.current = current?.id ?? 0;
 
-  const allBoxesHidden = boxes.length > 0 && boxes.every((b) => hiddenBoxIds.has(b.id));
-
   const toggleBoxVisible = (id: number) => {
     setHiddenBoxIds((prev) => {
       const next = new Set(prev);
@@ -174,14 +205,6 @@ export default function AnnotationScreen({
       else next.add(id);
       return next;
     });
-  };
-
-  const toggleAllBoxesVisible = () => {
-    if (allBoxesHidden) {
-      setHiddenBoxIds(new Set());
-      return;
-    }
-    setHiddenBoxIds(new Set(boxes.map((b) => b.id)));
   };
 
   useEffect(() => {
@@ -209,13 +232,10 @@ export default function AnnotationScreen({
   }, [taskClasses]);
 
   useEffect(() => {
-    const el = imageListRef.current?.querySelector<HTMLElement>(`[data-img-idx="${idx}"]`);
-    el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [idx]);
-
-  useEffect(() => {
     if (selectedBox == null) return;
-    const el = boxListRef.current?.querySelector<HTMLElement>(`[data-box-id="${selectedBox}"]`);
+    const el =
+      boxListRef.current?.querySelector<HTMLElement>(`[data-box-id="${selectedBox}"]`) ??
+      segmentListRef.current?.querySelector<HTMLElement>(`[data-box-id="${selectedBox}"]`);
     el?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, [selectedBox, boxes]);
 
@@ -301,6 +321,12 @@ export default function AnnotationScreen({
       }
 
       if (inField) return;
+
+      if (e.code === "Space" || e.key === " ") {
+        e.preventDefault();
+        slideshowToggleRef.current();
+        return;
+      }
 
       if (mod && k === "z" && !e.shiftKey) {
         e.preventDefault();
@@ -859,14 +885,28 @@ export default function AnnotationScreen({
       if (next < 0 || next >= images.length || next === idx) return;
       const ok = await flushSave();
       if (!ok) return;
-      onIdxChange(next);
+      await Promise.resolve(onIdxChange(next));
     },
     [flushSave, idx, images.length, onIdxChange],
   );
 
-  goToIndexRef.current = (next: number) => {
-    void goToIndex(next);
-  };
+  goToIndexRef.current = goToIndex;
+
+  const getSlideshowIdx = useCallback(() => hotkeyRef.current.idx, []);
+  const slideshowNext = useCallback(async () => {
+    const next = Math.min(images.length - 1, hotkeyRef.current.idx + 1);
+    if (next === hotkeyRef.current.idx) return;
+    prefetchIndexRef.current?.(next);
+    await goToIndex(next);
+  }, [goToIndex, images.length]);
+  const { playing: slideshowPlaying, toggle: toggleSlideshow, speed: slideshowSpeed, cycleSpeed: cycleSlideshowSpeed } =
+    useImageSlideshow(images.length, getSlideshowIdx, slideshowNext);
+  slideshowToggleRef.current = toggleSlideshow;
+
+  useEffect(() => {
+    const el = imageListRef.current?.querySelector<HTMLElement>(`[data-img-idx="${idx}"]`);
+    el?.scrollIntoView({ block: "nearest", behavior: slideshowPlaying ? "instant" : "smooth" });
+  }, [idx, slideshowPlaying]);
 
   const selectBox = (id: number | null) => {
     if (id === selectedBox) return;
@@ -1200,29 +1240,28 @@ export default function AnnotationScreen({
 
       <div className="annotate-grid">
         <aside className="annotate-panel left">
-          <div className="panel-section-title">Images</div>
+          <div className="anno-image-sidebar-head">
+            {showSlideshowToggle ? (
+              <AnnoSlideshowToggle
+                playing={slideshowPlaying}
+                speed={slideshowSpeed}
+                onToggle={toggleSlideshow}
+                onCycleSpeed={cycleSlideshowSpeed}
+                disabled={images.length <= 1}
+              />
+            ) : null}
+            <div className="panel-section-title">Images</div>
+          </div>
           <div className="anno-image-list pretty-scroll" ref={imageListRef}>
             {images.map((im, i) => (
-              <button
+              <AnnoImageListItem
                 key={im.id}
-                type="button"
-                data-img-idx={i}
-                className={`anno-image-row ${i === idx ? "active" : ""}`}
+                index={i}
+                name={im.filename || im.image_source.split("/").pop() || `image-${im.id}`}
+                status={im.status}
+                active={i === idx}
                 onClick={() => goToIndexRef.current(i)}
-              >
-                <span
-                  className={`dot ${
-                    im.status === "Accepted"
-                      ? "accepted"
-                      : im.status === "Rejected"
-                        ? "rejected"
-                        : "unseen"
-                  }`}
-                />
-                <span className="anno-image-row-name">
-                  {im.filename || im.image_source.split("/").pop()}
-                </span>
-              </button>
+              />
             ))}
           </div>
         </aside>
@@ -1398,50 +1437,58 @@ export default function AnnotationScreen({
         <aside className="annotate-panel right">
           <div className="anno-panel-card anno-fixed-boxes">
             <div className="panel-section-title anno-section-title-row">
-              <span>Boxes ({boxes.length})</span>
+              <span className="anno-section-title-with-icon">
+                <IconBox size={13} />
+                Boxes ({plainBoxes.length})
+              </span>
               <button
                 type="button"
-                className={`anno-vis-btn ${allBoxesHidden ? "off" : ""}`}
-                title={allBoxesHidden ? "Hiện tất cả box" : "Ẩn tất cả box"}
-                disabled={boxes.length === 0}
-                onClick={toggleAllBoxesVisible}
+                className={`anno-vis-btn ${allPlainHidden ? "off" : ""}`}
+                title={allPlainHidden ? "Hiện tất cả box" : "Ẩn tất cả box"}
+                disabled={plainBoxes.length === 0}
+                onClick={() => toggleListVisible(plainBoxes.map((b) => b.id), !allPlainHidden)}
               >
-                {allBoxesHidden ? <IconEyeOff size={13} /> : <IconEye size={13} />}
+                {allPlainHidden ? <IconEyeOff size={13} /> : <IconEye size={13} />}
               </button>
             </div>
-            <div className="anno-box-list pretty-scroll" ref={boxListRef}>
-              {boxes.length === 0 && <span className="anno-muted">—</span>}
-              {boxes.map((b) => {
-                const hidden = hiddenBoxIds.has(b.id);
-                return (
-                  <div
-                    key={b.id}
-                    data-box-id={b.id}
-                    className={`anno-box-row ${selectedBox === b.id ? "selected" : ""} ${hidden ? "hidden-box" : ""}`}
-                  >
-                    <button
-                      type="button"
-                      className="anno-box-row-main"
-                      onClick={() => selectBox(b.id)}
-                    >
-                      <span className="anno-box-swatch" style={{ background: colorOf(b.class) }} />
-                      <span className="anno-box-row-name">{b.class || "(no class)"}</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={`anno-vis-btn ${hidden ? "off" : ""}`}
-                      title={hidden ? "Hiện box" : "Ẩn box"}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggleBoxVisible(b.id);
-                      }}
-                    >
-                      {hidden ? <IconEyeOff size={12} /> : <IconEye size={12} />}
-                    </button>
-                  </div>
-                );
-              })}
+            <AnnoShapeList
+              items={plainBoxes}
+              kind="box"
+              selectedId={selectedBox}
+              hiddenIds={hiddenBoxIds}
+              colorOf={colorOf}
+              onSelect={selectBox}
+              onToggleVisible={toggleBoxVisible}
+              listRef={boxListRef}
+            />
+          </div>
+
+          <div className="anno-panel-card anno-fixed-segments">
+            <div className="panel-section-title anno-section-title-row">
+              <span className="anno-section-title-with-icon">
+                <IconSegment size={13} />
+                Segments ({segmentBoxes.length})
+              </span>
+              <button
+                type="button"
+                className={`anno-vis-btn ${allSegmentsHidden ? "off" : ""}`}
+                title={allSegmentsHidden ? "Hiện tất cả segment" : "Ẩn tất cả segment"}
+                disabled={segmentBoxes.length === 0}
+                onClick={() => toggleListVisible(segmentBoxes.map((b) => b.id), !allSegmentsHidden)}
+              >
+                {allSegmentsHidden ? <IconEyeOff size={13} /> : <IconEye size={13} />}
+              </button>
             </div>
+            <AnnoShapeList
+              items={segmentBoxes}
+              kind="segment"
+              selectedId={selectedBox}
+              hiddenIds={hiddenBoxIds}
+              colorOf={colorOf}
+              onSelect={selectBox}
+              onToggleVisible={toggleBoxVisible}
+              listRef={segmentListRef}
+            />
           </div>
 
           <div className="anno-panel-card anno-fixed-classes">
