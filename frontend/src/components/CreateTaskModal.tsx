@@ -15,6 +15,8 @@ export function CreateTaskModal({ onClose, onCreated }: { onClose: () => void; o
   const [classChips, setClassChips] = useState<ClassChip[]>([]);
   const [classInput, setClassInput] = useState("");
   const [golden, setGolden] = useState(2);
+  const [chunkInvalid, setChunkInvalid] = useState(false);
+  const [goldenInvalid, setGoldenInvalid] = useState(false);
   const [minRole, setMinRole] = useState("admin");
   const [uploadTab, setUploadTab] = useState<"mount" | "zip">("mount");
   const [mountPath, setMountPath] = useState("");
@@ -53,6 +55,10 @@ export function CreateTaskModal({ onClose, onCreated }: { onClose: () => void; o
     e.preventDefault();
     if (busy) return;
     setErr("");
+    if (chunkInvalid || goldenInvalid || chunkSize < 2 || golden < 2) {
+      setErr("Chunk size và Golden / job phải ≥ 2");
+      return;
+    }
     const fd = new FormData();
     fd.append("chunk_size", String(chunkSize));
     if (name) fd.append("name", name);
@@ -135,7 +141,13 @@ export function CreateTaskModal({ onClose, onCreated }: { onClose: () => void; o
           </div>
           <div className="field">
             <label className="field-label field-label-req">Chunk size</label>
-            <NumberStepper value={chunkSize} onChange={setChunkSize} min={2} disabled={busy} />
+            <NumberStepper
+              value={chunkSize}
+              onChange={setChunkSize}
+              min={2}
+              disabled={busy}
+              onInvalidChange={setChunkInvalid}
+            />
           </div>
         </div>
 
@@ -150,7 +162,13 @@ export function CreateTaskModal({ onClose, onCreated }: { onClose: () => void; o
           </div>
           <div className="field">
             <label className="field-label">Golden / job</label>
-            <NumberStepper value={golden} onChange={setGolden} min={2} disabled={busy} />
+            <NumberStepper
+              value={golden}
+              onChange={setGolden}
+              min={2}
+              disabled={busy}
+              onInvalidChange={setGoldenInvalid}
+            />
           </div>
         </div>
 

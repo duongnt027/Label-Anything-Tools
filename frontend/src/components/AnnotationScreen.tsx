@@ -1,6 +1,8 @@
 import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import { useSearchParams } from "react-router-dom";
 import { api, Box, imageUrl, LaImage } from "../api";
+import { useAuth } from "../auth";
 import AnnotationCanvas, { AnnotateTool, AnnotationCanvasHandle } from "./AnnotationCanvas";
 import { ClassCombobox } from "./ClassCombobox";
 import { ColoredOutlineChip } from "./ColoredOutlineChip";
@@ -88,6 +90,10 @@ export default function AnnotationScreen({
   onTrackBoxCreated,
   onTrackDeleted,
 }: Props) {
+  const [search] = useSearchParams();
+  const viewAs = search.get("view_as");
+  const adminView = search.get("admin_view");
+  const { user } = useAuth();
   const current = images[idx];
   const [selectedBox, setSelectedBox] = useState<number | null>(null);
   const [tool, setTool] = useState<AnnotateTool>("hand");
@@ -679,8 +685,8 @@ export default function AnnotationScreen({
     flushSync(() => {
       patchBoxes((prev) => [...prev, optimistic]);
       setSelectedBox(tempId);
-      setTool("hand");
     });
+    queueMicrotask(() => setTool("hand"));
     try {
       const created = await api<Box>(`/api/images/${current.id}/boxes`, {
         method: "POST",
@@ -732,8 +738,8 @@ export default function AnnotationScreen({
     flushSync(() => {
       patchBoxes((prev) => [...prev, optimistic]);
       setSelectedBox(tempId);
-      setTool("hand");
     });
+    queueMicrotask(() => setTool("hand"));
     try {
       const created = await api<Box>(`/api/images/${current.id}/boxes`, {
         method: "POST",
@@ -771,7 +777,15 @@ export default function AnnotationScreen({
         trackOpGenRef.current += 1;
         const fromOrder = images[frameIdx]?.order_index ?? frameIdx;
         const cacheBustIds = images.slice(frameIdx).map((im) => im.id);
-        await api(`/api/jobs/${jobId}/delete-track-boxes`, {
+        let trackUrl = `/api/jobs/${jobId}/delete-track-boxes`;
+        if (user?.role === "admin") {
+          const adminQs = new URLSearchParams();
+          if (viewAs) adminQs.set("view_as", viewAs);
+          else adminQs.set("view_as", "annotator");
+          adminQs.set("admin_view", adminView || "annotator");
+          trackUrl += `?${adminQs.toString()}`;
+        }
+        await api(trackUrl, {
           method: "POST",
           body: JSON.stringify({ track_id: trackId, from_order_index: fromOrder }),
         });

@@ -1,4 +1,4 @@
-import { CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, Box, imageUrl, Job } from "../api";
 import AnnotationCanvas from "../components/AnnotationCanvas";
@@ -11,6 +11,7 @@ import { parseTagDetails, serializeTagDetails } from "../utils/tagDetails";
 type Stage2Box = Box & { image_source: string; img_id?: number };
 
 const BOX_TAGS = ["Thừa box", "Sai class", "Sai OCR", "Sai Caption", "Sai segment", "Sai box_points"];
+const DELETE_SKIP_CONFIRM_KEY = "la-review-s2-delete-no-ask";
 /** Expand crop viewport around the box (context padding). */
 const CROP_PAD = 1.75;
 
@@ -108,6 +109,25 @@ export default function ReviewStage2() {
   const [shapeFocusId, setShapeFocusId] = useState<number | null>(null);
   /** Which selected tag's detail is being edited (within the expanded box). */
   const [detailTag, setDetailTag] = useState<string | null>(null);
+  /** Compact card highlighted after delete — shows where to continue. */
+  const [continueHintId, setContinueHintId] = useState<number | null>(null);
+  const [deleteSkipConfirm, setDeleteSkipConfirm] = useState(() => {
+    try {
+      return localStorage.getItem(DELETE_SKIP_CONFIRM_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const scrollToBoxRef = useRef<number | null>(null);
+  const selectedIdRef = useRef<number | null>(null);
+  const canEditRef = useRef(canEdit);
+  const boxesRef = useRef(boxes);
+  const deleteSkipConfirmRef = useRef(deleteSkipConfirm);
+  const [checkedIds, setCheckedIds] = useState<Set<number>>(() => new Set());
+  selectedIdRef.current = selectedId;
+  canEditRef.current = canEdit;
+  boxesRef.current = boxes;
+  deleteSkipConfirmRef.current = deleteSkipConfirm;
 
   const leaveDashboard = () => {
     unlockJobOnLeave(jobId);
@@ -138,6 +158,14 @@ export default function ReviewStage2() {
   useEffect(load, [jobId, viewAs, user?.role, adminView]);
 
   useEffect(() => {
+    const valid = new Set(boxes.map((b) => b.id));
+    setCheckedIds((prev) => {
+      const next = new Set([...prev].filter((id) => valid.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [boxes]);
+
+  useEffect(() => {
     if (!jobId) return;
     const onUnload = () => unlockJobOnLeave(jobId);
     window.addEventListener("beforeunload", onUnload);
@@ -159,34 +187,144 @@ export default function ReviewStage2() {
   const decided = boxes.filter((b) => b.status === "Accepted" || b.status === "Rejected").length;
   const progressPct = boxes.length ? Math.round((decided / boxes.length) * 100) : 0;
 
-  const patchBox = async (id: number, patch: object) => {
-    if (!canEdit) return;
+  const patchBox = useCallback(async (id: number, patch: object) => {
+    if (!canEditRef.current) return;
     const updated = await api<Box>(`/api/images/boxes/${id}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
     });
     setBoxes((prev) => prev.map((b) => (b.id === id ? { ...b, ...updated } : b)));
-  };
+  }, []);
 
-  const deleteBox = async (id: number) => {
-    if (!canEdit) return;
-    if (!window.confirm("Xóa box này? Annotator sẽ không còn thấy box.")) return;
+  const deleteBox = useCallback(async (id: number) => {
+    if (!canEditRef.current) return;
+    if (
+      !deleteSkipConfirmRef.current &&
+      !window.confirm("Xóa box này? Annotator sẽ không còn thấy box.")
+    ) {
+      return;
+    }
+    const idx = boxesRef.current.findIndex((b) => b.id === id);
+    const prevId = idx > 0 ? boxesRef.current[idx - 1].id : null;
     await api(`/api/images/boxes/${id}`, { method: "DELETE" });
     setBoxes((prev) => prev.filter((b) => b.id !== id));
-    if (selectedId === id) {
+    setCheckedIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    setSelectedId(null);
+    setShapeFocusId(null);
+    setDetailTag(null);
+    if (prevId != null) {
+      setContinueHintId(prevId);
+      scrollToBoxRef.current = prevId;
+    } else {
+      setContinueHintId(null);
+    }
+  }, []);
+
+  const toggleChecked = useCallback((id: number) => {
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleAllInClass = useCallback((list: Stage2Box[]) => {
+    const ids = list.map((b) => b.id);
+    setCheckedIds((prev) => {
+      const allChecked = ids.length > 0 && ids.every((id) => prev.has(id));
+      const next = new Set(prev);
+      if (allChecked) ids.forEach((id) => next.delete(id));
+      else ids.forEach((id) => next.add(id));
+      return next;
+    });
+  }, []);
+
+  const deleteCheckedInClass = useCallback(async (list: Stage2Box[]) => {
+    if (!canEditRef.current) return;
+    const ids = list.filter((b) => checkedIds.has(b.id)).map((b) => b.id);
+    if (!ids.length) return;
+    if (
+      !deleteSkipConfirmRef.current &&
+      !window.confirm(`Xóa ${ids.length} box đã chọn? Annotator sẽ không còn thấy các box này.`)
+    ) {
+      return;
+    }
+    await Promise.all(ids.map((id) => api(`/api/images/boxes/${id}`, { method: "DELETE" })));
+    const idSet = new Set(ids);
+    setBoxes((prev) => prev.filter((b) => !idSet.has(b.id)));
+    setCheckedIds((prev) => {
+      const next = new Set(prev);
+      ids.forEach((id) => next.delete(id));
+      return next;
+    });
+    if (selectedIdRef.current != null && idSet.has(selectedIdRef.current)) {
       setSelectedId(null);
       setShapeFocusId(null);
       setDetailTag(null);
     }
-  };
+  }, [checkedIds]);
+
+  const closeBox = useCallback((id: number) => {
+    setContinueHintId(id);
+    setSelectedId(null);
+    setShapeFocusId(null);
+    setDetailTag(null);
+  }, []);
+
+  useEffect(() => {
+    const id = scrollToBoxRef.current;
+    if (id == null || continueHintId !== id) return;
+    scrollToBoxRef.current = null;
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-review-s2-box="${id}"]`)
+        ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+  }, [continueHintId, boxes]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+
+      const id = selectedIdRef.current;
+      if (id == null) return;
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeBox(id);
+        return;
+      }
+      if (!canEditRef.current) return;
+
+      const k = e.key.toLowerCase();
+      if (e.key === "Delete" || k === "x") {
+        e.preventDefault();
+        void deleteBox(id);
+      } else if (k === "a") {
+        e.preventDefault();
+        void patchBox(id, { status: "Accepted" });
+      } else if (k === "r") {
+        e.preventDefault();
+        void patchBox(id, { status: "Rejected" });
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [closeBox, deleteBox, patchBox]);
 
   const selectBox = (id: number) => {
     if (selectedId === id) {
-      setSelectedId(null);
-      setShapeFocusId(null);
-      setDetailTag(null);
+      closeBox(id);
       return;
     }
+    setContinueHintId(null);
     setSelectedId(id);
     setShapeFocusId(id);
     setDetailTag(null);
@@ -240,7 +378,6 @@ export default function ReviewStage2() {
     await patchBox(boxId, { details });
   };
 
-  /** Auto-resolve remaining boxes, then accept/reject job and leave. */
   const finishAndLeave = async (accept: boolean) => {
     if (busy || !canEdit) return;
     setBusy(true);
@@ -262,9 +399,15 @@ export default function ReviewStage2() {
     }
   };
 
+  const scrollSummaryIntoView = (summary: HTMLElement) => {
+    requestAnimationFrame(() => {
+      summary.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
+  };
+
   return (
-    <div className="review-s2-root pretty-scroll">
-      <div className="review-s2-bar">
+    <div className="annotate-root review-s2-root">
+      <header className="anno-topbar review-s2-bar">
         <button type="button" className="topbar-btn anno-topbar-btn" onClick={leaveDashboard}>
           ← Dashboard
         </button>
@@ -291,18 +434,71 @@ export default function ReviewStage2() {
         >
           Submit stage 2
         </button>
-      </div>
+      </header>
 
+      <div className="review-s2-body pretty-scroll">
       <div className="review-s2-meta">
-        {canEdit
-          ? "Chỉ ảnh đã Accept S1 mới hiện ở đây. Click crop để mở review; kéo box/segment trực tiếp trên ảnh."
-          : "Chế độ chỉ xem — không thể gắn tag hay kết thúc job."}
+        <span>
+          {canEdit
+            ? "Click crop để mở review. Phím tắt (khi thẻ mở): Esc đóng · A accept · R reject · Delete/X xóa."
+            : "Chế độ chỉ xem — không thể gắn tag hay kết thúc job."}
+        </span>
+        {canEdit && (
+          <label className="review-s2-delete-skip">
+            <input
+              type="checkbox"
+              checked={deleteSkipConfirm}
+              onChange={() => {
+                setDeleteSkipConfirm((v) => {
+                  const next = !v;
+                  try {
+                    localStorage.setItem(DELETE_SKIP_CONFIRM_KEY, next ? "1" : "0");
+                  } catch {
+                    /* ignore */
+                  }
+                  return next;
+                });
+              }}
+            />
+            Delete won&apos;t ask
+          </label>
+        )}
       </div>
 
-      {byClass.map(([cls, list]) => (
+      {byClass.map(([cls, list]) => {
+        const sectionChecked = list.filter((b) => checkedIds.has(b.id)).length;
+        const allSectionChecked = list.length > 0 && sectionChecked === list.length;
+        return (
         <details key={cls} className="review-s2-section" open>
-          <summary>
-            <b>{cls}</b>
+          <summary
+            onClick={(e) => scrollSummaryIntoView(e.currentTarget)}
+          >
+            <span className="review-s2-section-class-chip">{cls}</span>
+            {canEdit && (
+              <span
+                className="review-s2-section-actions"
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => e.stopPropagation()}
+              >
+                <button
+                  type="button"
+                  className="review-s2-section-btn"
+                  onClick={() => toggleAllInClass(list)}
+                  title={allSectionChecked ? "Bỏ chọn tất cả trong class" : "Chọn tất cả trong class"}
+                >
+                  {allSectionChecked ? "Bỏ chọn" : "Tick all"}
+                </button>
+                <button
+                  type="button"
+                  className="review-s2-section-btn review-s2-section-btn-danger"
+                  disabled={sectionChecked === 0}
+                  onClick={() => void deleteCheckedInClass(list)}
+                  title="Xóa các box đã tick trong class này"
+                >
+                  Xóa đã chọn{sectionChecked > 0 ? ` (${sectionChecked})` : ""}
+                </button>
+              </span>
+            )}
             <span className="review-s2-section-count">
               {list.length} annotation · {list.filter((b) => b.status !== "Unseen").length} đã quyết
             </span>
@@ -313,15 +509,34 @@ export default function ReviewStage2() {
               const src = imageUrl(imgId);
               const style = cropStyle(b.box_points || "0.5 0.5 0.1 0.1");
               const expanded = selectedId === b.id;
+              const ticked = checkedIds.has(b.id);
               const detailsMap = parseTagDetails(b.details);
               const cropView = paddedView(b.box_points);
               return (
                 <div
                   key={b.id}
+                  data-review-s2-box={b.id}
                   className={`review-s2-card ${expanded ? "expanded" : "compact"} ${
+                    ticked ? "checked" : ""
+                  } ${continueHintId === b.id ? "continue-hint" : ""} ${
                     b.status === "Accepted" ? "accepted" : b.status === "Rejected" ? "rejected" : ""
                   }`}
+                  onContextMenu={(e) => {
+                    if (!canEdit) return;
+                    e.preventDefault();
+                    toggleChecked(b.id);
+                  }}
                 >
+                  {canEdit && (
+                    <input
+                      type="checkbox"
+                      className="jobs-tick review-s2-card-tick"
+                      checked={ticked}
+                      aria-label={`Chọn box #${b.id}`}
+                      onChange={() => toggleChecked(b.id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  )}
                   {!expanded ? (
                     <button
                       type="button"
@@ -528,7 +743,8 @@ export default function ReviewStage2() {
             })}
           </div>
         </details>
-      ))}
+        );
+      })}
 
       {boxes.length === 0 && (
         <div className="anno-muted review-s2-empty">
@@ -554,6 +770,7 @@ export default function ReviewStage2() {
         >
           Reject job
         </button>
+      </div>
       </div>
     </div>
   );

@@ -390,6 +390,21 @@ def _admin_view_permissions(
     return True, False, effective
 
 
+def _resolve_job_permissions(
+    user: User, job: Job, db: Session, view_as: str | None, admin_view: str | None
+) -> tuple[bool, bool, str]:
+    """Returns (can_view, can_edit, effective_role)."""
+    if user.role == UserRole.admin and (
+        view_as in ("annotator", "reviewer") or admin_view in ("annotator", "s1", "s2")
+    ):
+        return _admin_view_permissions(job, view_as, admin_view, user.id)
+    can_view, can_edit = _can_edit_job(user, job, db, view_as)
+    effective_role = user.role.value
+    if user.role == UserRole.admin and view_as in ("annotator", "reviewer"):
+        effective_role = view_as
+    return can_view, can_edit, effective_role
+
+
 @router.post("/{job_id}/open")
 def open_job(
     job_id: int,
@@ -403,17 +418,7 @@ def open_job(
     if not job:
         raise HTTPException(404)
 
-    if user.role == UserRole.admin and (
-        view_as in ("annotator", "reviewer") or admin_view in ("annotator", "s1", "s2")
-    ):
-        can_view, can_edit, effective_role = _admin_view_permissions(
-            job, view_as, admin_view, user.id
-        )
-    else:
-        can_view, can_edit = _can_edit_job(user, job, db, view_as)
-        effective_role = user.role.value
-        if user.role == UserRole.admin and view_as in ("annotator", "reviewer"):
-            effective_role = view_as
+    can_view, can_edit, effective_role = _resolve_job_permissions(user, job, db, view_as, admin_view)
 
     if not can_view:
         raise HTTPException(403)
@@ -517,6 +522,8 @@ def view_image(
 def delete_track_boxes(
     job_id: int,
     body: TrackBoxesDeleteIn,
+    view_as: str | None = Query(None),
+    admin_view: str | None = Query(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -524,7 +531,7 @@ def delete_track_boxes(
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404)
-    can_view, can_edit = _can_edit_job(user, job, db, None)
+    can_view, can_edit, _ = _resolve_job_permissions(user, job, db, view_as, admin_view)
     if not can_view:
         raise HTTPException(403)
     if not can_edit:
@@ -562,9 +569,26 @@ def delete_track_boxes(
 
 
 @router.post("/{job_id}/submit")
-def submit_job(job_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def submit_job(
+    job_id: int,
+    view_as: str | None = Query(None),
+    admin_view: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     job = db.get(Job, job_id)
-    if not job or job.assignee_id != user.id:
+    if not job:
+        raise HTTPException(404)
+    can_view, can_edit, effective_role = _resolve_job_permissions(user, job, db, view_as, admin_view)
+    if not can_view:
+        raise HTTPException(403)
+    if user.role == UserRole.annotator:
+        if job.assignee_id != user.id:
+            raise HTTPException(403)
+    elif user.role == UserRole.admin:
+        if effective_role != "annotator" or not can_edit:
+            raise HTTPException(403)
+    else:
         raise HTTPException(403)
     img_num = count_job_images(db, job.id)
     if job.annotator_process < img_num:

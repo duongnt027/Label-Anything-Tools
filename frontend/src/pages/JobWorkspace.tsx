@@ -15,6 +15,20 @@ function parseAdminView(raw: string | null): AdminJobView | null {
   return null;
 }
 
+function jobAdminQuery(
+  userRole: string | undefined,
+  viewAs: string | null,
+  adminView: AdminJobView | null,
+  screen: AdminJobView = "annotator",
+): string {
+  const qs = new URLSearchParams();
+  if (viewAs) qs.set("view_as", viewAs);
+  else if (userRole === "admin") qs.set("view_as", screen === "annotator" ? "annotator" : "reviewer");
+  if (userRole === "admin") qs.set("admin_view", adminView ?? screen);
+  const s = qs.toString();
+  return s ? `?${s}` : "";
+}
+
 export default function JobWorkspace() {
   const { jobId } = useParams();
   const [search] = useSearchParams();
@@ -22,7 +36,7 @@ export default function JobWorkspace() {
   const viewAs = search.get("view_as");
   const adminView = parseAdminView(search.get("admin_view"));
   const nav = useNavigate();
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const [job, setJob] = useState<Job | null>(null);
   const [canEdit, setCanEdit] = useState(false);
   const [images, setImages] = useState<LaImage[]>([]);
@@ -74,7 +88,7 @@ export default function JobWorkspace() {
     showAnnotator && (user?.role === "annotator" || viewAs === "annotator" || user?.role === "admin");
 
   useEffect(() => {
-    if (!jobId) return;
+    if (!jobId || authLoading) return;
     bootSyncedRef.current = false;
     setResumeDecided(false);
     setResumeOfferIndex(undefined);
@@ -102,7 +116,11 @@ export default function JobWorkspace() {
       setCanEdit(r.can_edit);
       setTaskClasses(r.task_classes || []);
       const ri = r.resume_order_index;
-      if (typeof ri === "number" && ri > 0) {
+      if (user?.role === "admin") {
+        setResumeOfferIndex(null);
+        setWorkspaceBootIndex(0);
+        setResumeDecided(true);
+      } else if (typeof ri === "number" && ri > 0) {
         setResumeOfferIndex(ri);
         setWorkspaceBootIndex(ri);
         setResumeDecided(false);
@@ -118,7 +136,7 @@ export default function JobWorkspace() {
       }
     });
     api<LaImage[]>(`/api/jobs/${jobId}/images`).then(setImages);
-  }, [jobId, viewAs, nav, adminView, user?.role, screen, showAnnotator, showS1]);
+  }, [jobId, viewAs, nav, adminView, user?.role, screen, showAnnotator, showS1, authLoading]);
 
   useEffect(() => {
     if (!jobId) return;
@@ -220,7 +238,14 @@ export default function JobWorkspace() {
   const submitJob = async () => {
     if (!canEdit || !job) return;
     try {
-      await api(`/api/jobs/${jobId}/submit`, { method: "POST" });
+      await api(
+        `/api/jobs/${jobId}/submit${jobAdminQuery(user?.role, viewAs, adminView, "annotator")}`,
+        { method: "POST" },
+      );
+      if (user?.role === "admin") {
+        nav(`/jobs/${jobId}?mode=review&view_as=reviewer&admin_view=s1`, { replace: true });
+        return;
+      }
       unlockJobOnLeave(jobId);
       nav("/annotator");
     } catch (ex) {
@@ -284,6 +309,7 @@ export default function JobWorkspace() {
           headerAfterProgress={jobId ? <AdminViewSwitcher jobId={jobId} current="s1" /> : null}
           bootIndex={workspaceBootIndex}
           workspaceReady={resumeDecided}
+          taskClasses={taskClasses}
         />
       </>
     );

@@ -1,6 +1,6 @@
 import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, Box, imageUrl, Job, LaImage } from "../api";
-import AnnotationCanvas, { AnnotateTool, ShapeFilter } from "../components/AnnotationCanvas";
+import AnnotationCanvas, { ShapeFilter } from "../components/AnnotationCanvas";
 import { AnnoSlideshowToggle } from "../components/AnnoSlideshowToggle";
 import { AnnoImageListItem } from "../components/AnnoImageListItem";
 import { IconBox, IconHand, IconSegment } from "../components/icons";
@@ -34,6 +34,7 @@ type Props = {
   bootIndex?: number;
   /** When false, defer loading boxes / view_image until user picks resume. */
   workspaceReady?: boolean;
+  taskClasses?: string[];
 };
 
 export default function ReviewStage1({
@@ -49,6 +50,7 @@ export default function ReviewStage1({
   headerAfterProgress,
   bootIndex = 0,
   workspaceReady = true,
+  taskClasses = [],
 }: Props) {
   const { user } = useAuth();
   const showSlideshowToggle = user?.role === "admin" || user?.role === "reviewer";
@@ -56,7 +58,8 @@ export default function ReviewStage1({
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [busy, setBusy] = useState(false);
   const [detailTag, setDetailTag] = useState<string | null>(null);
-  const [viewTool, setViewTool] = useState<AnnotateTool>("hand");
+  const [showBox, setShowBox] = useState(true);
+  const [showSegment, setShowSegment] = useState(true);
   const imageListRef = useRef<HTMLDivElement>(null);
   const bootSyncedRef = useRef(false);
   const idxRef = useRef(0);
@@ -80,20 +83,36 @@ export default function ReviewStage1({
     [jobId, onJobChange],
   );
 
+  const applyImageIndex = useCallback(
+    (next: number) => {
+      if (next < 0 || next >= images.length) return;
+      const im = images[next];
+      if (!im) return;
+      setBoxes(boxesCacheRef.current.get(im.id) ?? []);
+      setIdx(next);
+    },
+    [images],
+  );
+
+  const prefetchAround = useCallback(
+    (center: number) => {
+      if (!jobId || !images.length) return;
+      for (const j of [center - 3, center - 2, center - 1, center, center + 1, center + 2, center + 3]) {
+        if (j < 0 || j >= images.length) continue;
+        prefetchJobImageBoxes(jobId, images[j].id, boxesCacheRef.current);
+        void preloadImageId(images[j].id).catch(() => {});
+      }
+    },
+    [images, jobId],
+  );
+
   const getSlideshowIdx = useCallback(() => idxRef.current, []);
   const slideshowNext = useCallback(async () => {
     const next = Math.min(images.length - 1, idxRef.current + 1);
     if (next === idxRef.current) return;
-    const im = images[next];
-    if (im && jobId) {
-      prefetchJobImageBoxes(jobId, im.id, boxesCacheRef.current);
-      void preloadImageId(im.id).catch(() => {});
-      const cached = boxesCacheRef.current.get(im.id);
-      if (cached) setBoxes(cached);
-    }
-    setIdx(next);
+    applyImageIndex(next);
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
-  }, [images, jobId]);
+  }, [applyImageIndex, images.length]);
   const { playing: slideshowPlaying, toggle: toggleSlideshow, speed: slideshowSpeed, cycleSpeed: cycleSlideshowSpeed } =
     useImageSlideshow(images.length, getSlideshowIdx, slideshowNext);
   slideshowToggleRef.current = toggleSlideshow;
@@ -107,8 +126,8 @@ export default function ReviewStage1({
     if (bootSyncedRef.current) return;
     bootSyncedRef.current = true;
     const start = Math.min(Math.max(0, bootIndex), images.length - 1);
-    setIdx(start);
-  }, [workspaceReady, images.length, bootIndex]);
+    applyImageIndex(start);
+  }, [workspaceReady, images.length, bootIndex, applyImageIndex]);
 
   const needsStage1 = useMemo(
     () => images.some((im) => im.status === "Unseen" || im.status === "Rejected"),
@@ -126,7 +145,7 @@ export default function ReviewStage1({
     : "";
 
   const shapeFilter: ShapeFilter =
-    viewTool === "box" ? "box" : viewTool === "segment" ? "segment" : "all";
+    showBox && showSegment ? "all" : showBox ? "box" : showSegment ? "segment" : "none";
 
   const selectedTags = current?.tag || [];
   const negativeTags = useMemo(
@@ -148,24 +167,31 @@ export default function ReviewStage1({
   useEffect(() => {
     if (!workspaceReady) return;
     if (!needsStage1 && images.length) {
-      setIdx(Math.max(0, images.length - 1));
+      applyImageIndex(Math.max(0, images.length - 1));
     }
-  }, [needsStage1, images.length, workspaceReady]);
+  }, [needsStage1, images.length, workspaceReady, applyImageIndex]);
+
+  useEffect(() => {
+    if (!workspaceReady || !images.length || !jobId) return;
+    prefetchAround(idx);
+  }, [idx, images.length, jobId, workspaceReady, prefetchAround]);
 
   useEffect(() => {
     if (!workspaceReady || !current || !jobId) return;
     const gen = ++boxesFetchGenRef.current;
     const cached = boxesCacheRef.current.get(current.id);
-    if (cached) setBoxes(cached);
-    else {
-      void api<Box[]>(`/api/jobs/${jobId}/images/${current.id}/boxes`).then((b) => {
-        if (gen !== boxesFetchGenRef.current) return;
-        boxesCacheRef.current.set(current.id, b);
-        setBoxes(b);
-      });
+    if (cached) {
+      setBoxes(cached);
+      scheduleViewImage(current.id);
+      return;
     }
+    setBoxes([]);
+    void api<Box[]>(`/api/jobs/${jobId}/images/${current.id}/boxes`).then((b) => {
+      if (gen !== boxesFetchGenRef.current) return;
+      boxesCacheRef.current.set(current.id, b);
+      setBoxes(b);
+    });
     scheduleViewImage(current.id);
-    void preloadImageId(current.id).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id, jobId, workspaceReady]);
 
@@ -192,15 +218,15 @@ export default function ReviewStage1({
       }
       if (e.key === "ArrowLeft" || k === "d") {
         e.preventDefault();
-        setIdx((i) => Math.max(0, i - 1));
+        applyImageIndex(Math.max(0, idxRef.current - 1));
       } else if (e.key === "ArrowRight" || k === "f") {
         e.preventDefault();
-        setIdx((i) => Math.min(images.length - 1, i + 1));
+        applyImageIndex(Math.min(images.length - 1, idxRef.current + 1));
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [images.length]);
+  }, [images.length, applyImageIndex]);
 
   const patchImage = async (patch: { tag?: string[]; details?: string; caption?: string }) => {
     if (!current || !canEdit) return null;
@@ -311,7 +337,7 @@ export default function ReviewStage1({
                 min={0}
                 max={Math.max(0, images.length - 1)}
                 value={idx}
-                onChange={(e) => setIdx(Number(e.target.value))}
+                onChange={(e) => applyImageIndex(Number(e.target.value))}
               />
             </div>
             <span className="anno-progress-pct">{imagePct}%</span>
@@ -323,7 +349,7 @@ export default function ReviewStage1({
             type="button"
             className="topbar-btn anno-topbar-btn"
             disabled={idx <= 0}
-            onClick={() => setIdx((i) => Math.max(0, i - 1))}
+            onClick={() => applyImageIndex(Math.max(0, idx - 1))}
             title="Ảnh trước (D)"
           >
             D
@@ -332,7 +358,7 @@ export default function ReviewStage1({
             type="button"
             className="topbar-btn anno-topbar-btn"
             disabled={idx >= images.length - 1}
-            onClick={() => setIdx((i) => Math.min(images.length - 1, i + 1))}
+            onClick={() => applyImageIndex(Math.min(images.length - 1, idx + 1))}
             title="Ảnh sau (F)"
           >
             F
@@ -381,7 +407,7 @@ export default function ReviewStage1({
                   name={name}
                   status={im.status}
                   active={i === idx}
-                  onClick={() => setIdx(i)}
+                  onClick={() => applyImageIndex(i)}
                 />
               );
             })}
@@ -392,6 +418,7 @@ export default function ReviewStage1({
           <div className="canvas-stage-wrap">
             <AnnotationCanvas
               imageUrl={imageUrl(current.id)}
+              imageId={current.id}
               boxes={boxes}
               selectedId={null}
               tool="hand"
@@ -404,25 +431,25 @@ export default function ReviewStage1({
             <div className="anno-float-tools review-s1-view-tools">
               <button
                 type="button"
-                className={`anno-float-btn ${viewTool === "box" ? "active" : ""}`}
-                onClick={() => setViewTool("box")}
-                title="Chỉ hiển thị box"
+                className={`anno-float-btn ${showBox ? "active" : ""}`}
+                onClick={() => setShowBox((v) => !v)}
+                title="Bật/tắt hiển thị box"
               >
                 <IconBox size={14} />
               </button>
               <button
                 type="button"
-                className={`anno-float-btn ${viewTool === "segment" ? "active" : ""}`}
-                onClick={() => setViewTool("segment")}
-                title="Chỉ hiển thị segment"
+                className={`anno-float-btn ${showSegment ? "active" : ""}`}
+                onClick={() => setShowSegment((v) => !v)}
+                title="Bật/tắt hiển thị segment"
               >
                 <IconSegment size={14} />
               </button>
               <button
                 type="button"
-                className={`anno-float-btn ${viewTool === "hand" ? "active" : ""}`}
-                onClick={() => setViewTool("hand")}
-                title="Hiển thị tất cả — kéo pan ảnh"
+                className="anno-float-btn active"
+                title="Di chuyển ảnh"
+                aria-label="Di chuyển ảnh"
               >
                 <IconHand size={14} />
               </button>
@@ -541,6 +568,27 @@ export default function ReviewStage1({
             </div>
           </footer>
         </div>
+
+        <aside className="annotate-panel right review-s1-classes-panel">
+          <div className="panel-section-title">Nhãn trong job</div>
+          <div className="review-s1-class-hint anno-muted">
+            {taskClasses.length > 0
+              ? `${taskClasses.length} nhãn cần có trong ảnh`
+              : "Chưa có nhãn nào trong task"}
+          </div>
+          <div className="review-s1-class-list pretty-scroll">
+            {taskClasses.length === 0 && <span className="anno-muted">—</span>}
+            {taskClasses.map((c) => (
+              <span
+                key={c}
+                className="review-s1-class-chip"
+                style={{ borderColor: UNIFORM_STROKE, color: UNIFORM_STROKE }}
+              >
+                {c}
+              </span>
+            ))}
+          </div>
+        </aside>
       </div>
     </div>
   );
