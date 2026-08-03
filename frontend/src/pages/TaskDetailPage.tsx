@@ -7,6 +7,10 @@ import { ExportOptions, ExportOptionsModal } from "../components/ExportOptionsMo
 import { ImportGoldenModal } from "../components/ImportGoldenModal";
 import { ImportTaskModal } from "../components/ImportTaskModal";
 import { IconExport, IconFolderOpen } from "../components/icons";
+import { TaskDetailHero, TaskDetailInfo } from "../components/TaskDetailHero";
+import TaskStatisticsPanel from "../components/TaskStatisticsPanel";
+
+type TaskScreenTab = "golden" | "jobs" | "statistics";
 
 function formatDateTime(iso: string | undefined) {
   if (!iso) return "—";
@@ -42,12 +46,14 @@ export default function TaskDetailPage() {
   const [search] = useSearchParams();
   const nav = useNavigate();
   const tabParam = search.get("tab");
-  const [screenTab, setScreenTab] = useState<"golden" | "jobs">(
-    tabParam === "golden" ? "golden" : "jobs",
+  const [screenTab, setScreenTab] = useState<TaskScreenTab>(
+    tabParam === "golden" ? "golden" : tabParam === "statistics" ? "statistics" : "jobs",
   );
 
   useEffect(() => {
-    if (tabParam === "golden" || tabParam === "jobs") setScreenTab(tabParam);
+    if (tabParam === "golden" || tabParam === "jobs" || tabParam === "statistics") {
+      setScreenTab(tabParam);
+    }
   }, [tabParam]);
   const [golden, setGolden] = useState<LaImage[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -59,12 +65,15 @@ export default function TaskDetailPage() {
   const [assigneesOpen, setAssigneesOpen] = useState(false);
   const [exportTarget, setExportTarget] = useState<ExportTarget | null>(null);
   const [pageSize, setPageSize] = useState(20);
+  const [taskInfo, setTaskInfo] = useState<TaskDetailInfo | null>(null);
 
+  const loadTask = () => api<TaskDetailInfo>(`/api/tasks/${taskId}`).then(setTaskInfo);
   const loadGolden = () => api<LaImage[]>(`/api/tasks/${taskId}/golden-pool`).then(setGolden);
   const loadJobs = () => api<Job[]>(`/api/jobs/by-task/${taskId}?tab=all`).then(setJobs);
   const loadAssignees = () => api<User[]>(`/api/tasks/${taskId}/assignees`).then(setAssignees);
 
   useEffect(() => {
+    loadTask().catch(console.error);
     loadGolden().catch(console.error);
     loadAssignees().catch(console.error);
     loadJobs().catch(console.error);
@@ -267,6 +276,10 @@ export default function TaskDetailPage() {
         </div>
       </div>
 
+      {taskInfo && (
+        <TaskDetailHero task={taskInfo} onRenamed={(name) => setTaskInfo((t) => (t ? { ...t, name } : t))} />
+      )}
+
       <div className="task-screen-tabs">
         <button
           type="button"
@@ -287,6 +300,16 @@ export default function TaskDetailPage() {
           }}
         >
           Jobs
+        </button>
+        <button
+          type="button"
+          className={`task-screen-tab ${screenTab === "statistics" ? "active" : ""}`}
+          onClick={() => {
+            setScreenTab("statistics");
+            nav(`/admin/tasks/${taskId}?tab=statistics`, { replace: true });
+          }}
+        >
+          Statistics
         </button>
       </div>
 
@@ -406,7 +429,7 @@ export default function TaskDetailPage() {
             </>
           )}
         </div>
-      ) : (
+      ) : screenTab === "jobs" ? (
         <div className={`dashboard-panel ${jobs.length === 0 ? "dashboard-panel-fill" : ""}`}>
           {jobs.length === 0 ? (
             <div className="dashboard-empty">
@@ -545,7 +568,9 @@ export default function TaskDetailPage() {
             </>
           )}
         </div>
-      )}
+      ) : taskId ? (
+        <TaskStatisticsPanel taskId={taskId} />
+      ) : null}
 
       {importGoldenOpen && taskId && (
         <ImportGoldenModal

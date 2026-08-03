@@ -6,15 +6,18 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_roles
 from app.models import (
+    Box,
     Image,
     Job,
     JobState,
+    Log,
     LogAction,
     LogTargetType,
     MinRoleToAddClass,
@@ -23,7 +26,21 @@ from app.models import (
     User,
     UserRole,
 )
-from app.schemas import ExportGoldenOptions, ExportOptions, MountDirEntry, MountTreeOut, TaskAssigneesIn, TaskCreate, TaskOut, UserOut
+from app.schemas import (
+    ExportGoldenOptions,
+    ExportOptions,
+    MountDirEntry,
+    MountTreeOut,
+    TaskAssigneesIn,
+    TaskCreate,
+    TaskOut,
+    TaskStatisticsOut,
+    TaskStatisticsSection,
+    TaskUpdate,
+    TaskUserStatistics,
+    TaskEventCount,
+    UserOut,
+)
 from app.api.users import _user_out
 from app.services.tasks import (
     apply_task_json_by_filename,
@@ -46,6 +63,52 @@ from app.services.tasks import (
 from app.services.jobs import count_task_images, write_log
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+STAT_SECTIONS: list[tuple[str, str, str, set[LogAction]]] = [
+    (
+        "workings",
+        "Workings",
+        "Annotate, xem ảnh, chỉnh box và tag",
+        {
+            LogAction.view_image,
+            LogAction.add_box,
+            LogAction.edit_box,
+            LogAction.delete_box,
+            LogAction.edit_image_tag,
+            LogAction.edit_box_tag,
+        },
+    ),
+    (
+        "workflow",
+        "Workflow",
+        "Submit, duyệt job, khóa/mở khóa và đổi state",
+        {
+            LogAction.submit_job,
+            LogAction.accept_job,
+            LogAction.reject_job,
+            LogAction.lock_job,
+            LogAction.unlock_job_auto,
+            LogAction.unlock_job_manual,
+            LogAction.change_job_state,
+        },
+    ),
+    (
+        "events",
+        "Events",
+        "Quản lý task, class, assign và golden pool",
+        {
+            LogAction.create_task,
+            LogAction.delete_task,
+            LogAction.add_class,
+            LogAction.remove_class,
+            LogAction.assign_job,
+            LogAction.add_to_golden_pool,
+            LogAction.inject_golden_images,
+            LogAction.add_user,
+            LogAction.remove_user,
+        },
+    ),
+]
 
 
 def _folder_from_server_mount(server_folder: str) -> Path:
@@ -214,6 +277,111 @@ def get_task(task_id: int, user: User = Depends(require_roles("admin")), db: Ses
     if not task:
         raise HTTPException(404)
     return _task_out(db, task)
+
+
+@router.patch("/{task_id}", response_model=TaskOut)
+def update_task(
+    task_id: int,
+    body: TaskUpdate,
+    user: User = Depends(require_roles("admin")),
+    db: Session = Depends(get_db),
+):
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404)
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "Tên task không được trống")
+        if len(name) > 255:
+            raise HTTPException(400, "Tên task quá dài")
+        task.name = name
+        task.modifier_id = user.id
+    db.commit()
+    db.refresh(task)
+    return _task_out(db, task)
+
+
+def _build_section_users(
+    by_user: dict[int, dict[str, int]],
+    users_map: dict[int, str],
+    allowed: set[LogAction],
+) -> list[TaskUserStatistics]:
+    allowed_values = {a.value for a in allowed}
+    out: list[TaskUserStatistics] = []
+    for uid, events_map in by_user.items():
+        filtered = {a: c for a, c in events_map.items() if a in allowed_values}
+        if not filtered:
+            continue
+        events = [TaskEventCount(action=a, count=c) for a, c in filtered.items()]
+        out.append(
+            TaskUserStatistics(
+                user_id=uid,
+                username=users_map.get(uid, f"user#{uid}"),
+                events=sorted(events, key=lambda e: (-e.count, e.action)),
+            )
+        )
+    out.sort(key=lambda u: (-sum(e.count for e in u.events), u.username.lower()))
+    return out
+
+
+@router.get("/{task_id}/statistics", response_model=TaskStatisticsOut)
+def task_statistics(
+    task_id: int, user: User = Depends(require_roles("admin")), db: Session = Depends(get_db)
+):
+    if not db.get(Task, task_id):
+        raise HTTPException(404)
+
+    job_ids = [r[0] for r in db.query(Job.id).filter(Job.task_id == task_id).all()]
+    image_ids = [r[0] for r in db.query(Image.id).filter(Image.task_id == task_id).all()]
+    box_ids = (
+        [r[0] for r in db.query(Box.id).join(Image).filter(Image.task_id == task_id).all()]
+        if image_ids
+        else []
+    )
+
+    scope = [
+        and_(Log.target_type == LogTargetType.task, Log.target_id == task_id),
+        and_(Log.target_type == LogTargetType.class_, Log.target_id == task_id),
+    ]
+    if job_ids:
+        scope.append(and_(Log.target_type == LogTargetType.job, Log.target_id.in_(job_ids)))
+    if image_ids:
+        scope.append(and_(Log.target_type == LogTargetType.image, Log.target_id.in_(image_ids)))
+    if box_ids:
+        scope.append(and_(Log.target_type == LogTargetType.box, Log.target_id.in_(box_ids)))
+
+    rows = (
+        db.query(Log.actor_id, Log.action, func.count(Log.id))
+        .filter(or_(*scope))
+        .group_by(Log.actor_id, Log.action)
+        .all()
+    )
+
+    by_user: dict[int, dict[str, int]] = {}
+    for actor_id, action, count in rows:
+        bucket = by_user.setdefault(actor_id, {})
+        bucket[action.value] = int(count)
+
+    user_ids = list(by_user.keys())
+    users_map = {}
+    if user_ids:
+        for u in db.query(User).filter(User.id.in_(user_ids)).all():
+            users_map[u.id] = u.username
+
+    sections: list[TaskStatisticsSection] = []
+    for key, label, description, actions in STAT_SECTIONS:
+        section_users = _build_section_users(by_user, users_map, actions)
+        if section_users:
+            sections.append(
+                TaskStatisticsSection(
+                    key=key,
+                    label=label,
+                    description=description,
+                    users=section_users,
+                )
+            )
+    return TaskStatisticsOut(sections=sections)
 
 
 @router.delete("/{task_id}")

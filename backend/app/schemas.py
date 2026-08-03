@@ -1,6 +1,28 @@
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class TaskEventCount(BaseModel):
+    action: str
+    count: int
+
+
+class TaskUserStatistics(BaseModel):
+    user_id: int
+    username: str
+    events: list[TaskEventCount]
+
+
+class TaskStatisticsSection(BaseModel):
+    key: str
+    label: str
+    description: str
+    users: list[TaskUserStatistics]
+
+
+class TaskStatisticsOut(BaseModel):
+    sections: list[TaskStatisticsSection]
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -39,6 +61,10 @@ class TaskCreate(BaseModel):
     classes: list[str] = Field(default_factory=list)
     min_role_to_add_class: str = "admin"
     golden_per_job: int = 2
+
+
+class TaskUpdate(BaseModel):
+    name: str | None = None
 
 
 class TaskOut(BaseModel):
