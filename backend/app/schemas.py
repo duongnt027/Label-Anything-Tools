@@ -19,8 +19,58 @@ class TaskStatisticsSection(BaseModel):
     users: list[TaskUserStatistics]
 
 
+class TaskQualityIssue(BaseModel):
+    kind: str
+    label: str
+    count: int
+
+
+class TaskJobUserActivity(BaseModel):
+    user_id: int
+    username: str
+    active_seconds: int
+    events: list[TaskEventCount]
+    issues: list[TaskQualityIssue]
+    submit_count: int
+    reject_count: int
+
+
+class TaskJobStatistics(BaseModel):
+    job_id: int
+    task_job_id: int
+    state: str
+    assignee_id: int | None
+    assignee_username: str | None
+    img_num: int
+    users: list[TaskJobUserActivity]
+
+
+class TaskUserJobActivity(BaseModel):
+    job_id: int
+    task_job_id: int
+    state: str
+    active_seconds: int
+    events: list[TaskEventCount]
+    issues: list[TaskQualityIssue]
+    submit_count: int
+    reject_count: int
+    is_assignee: bool
+
+
+class TaskUserOverview(BaseModel):
+    user_id: int
+    username: str
+    active_seconds: int
+    issues: list[TaskQualityIssue]
+    submit_count: int
+    reject_count: int
+    assigned_jobs: int
+    jobs: list[TaskUserJobActivity]
+
+
 class TaskStatisticsOut(BaseModel):
     sections: list[TaskStatisticsSection]
+    users: list[TaskUserOverview] = Field(default_factory=list)
 
 
 class Token(BaseModel):

@@ -2,18 +2,22 @@ import copy
 import json
 import os
 import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
+from app.api.jobs import ERROR_IMAGE_TAGS
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_roles
 from app.models import (
     Box,
+    BoxStatus,
     Image,
     Job,
     JobState,
@@ -23,6 +27,7 @@ from app.models import (
     MinRoleToAddClass,
     Task,
     TaskAssignee,
+    TZ,
     User,
     UserRole,
 )
@@ -36,6 +41,11 @@ from app.schemas import (
     TaskOut,
     TaskStatisticsOut,
     TaskStatisticsSection,
+    TaskQualityIssue,
+    TaskJobStatistics,
+    TaskJobUserActivity,
+    TaskUserOverview,
+    TaskUserJobActivity,
     TaskUpdate,
     TaskUserStatistics,
     TaskEventCount,
@@ -60,7 +70,7 @@ from app.services.tasks import (
     resolve_mount_dir,
     storage_path,
 )
-from app.services.jobs import count_task_images, write_log
+from app.services.jobs import count_job_images, count_task_images, write_log
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -109,6 +119,23 @@ STAT_SECTIONS: list[tuple[str, str, str, set[LogAction]]] = [
         },
     ),
 ]
+
+ACTIVE_LOG_ACTIONS = {
+    LogAction.view_image,
+    LogAction.add_box,
+    LogAction.edit_box,
+    LogAction.delete_box,
+    LogAction.edit_image_tag,
+    LogAction.edit_box_tag,
+    LogAction.submit_job,
+    LogAction.lock_job,
+}
+
+WORKING_LOG_ACTIONS = STAT_SECTIONS[0][3]
+
+SESSION_GAP_MINUTES = 15
+SESSION_MIN_SECONDS = 60
+SESSION_MAX_MINUTES = 120
 
 
 def _folder_from_server_mount(server_folder: str) -> Path:
@@ -325,6 +352,252 @@ def _build_section_users(
     return out
 
 
+def _aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=TZ)
+    return dt
+
+
+def _estimate_active_seconds(timestamps: list[datetime]) -> int:
+    if not timestamps:
+        return 0
+    ordered = sorted(_aware(t) for t in timestamps)
+    gap = timedelta(minutes=SESSION_GAP_MINUTES)
+    max_session = timedelta(minutes=SESSION_MAX_MINUTES)
+    total = 0.0
+    session_start = ordered[0]
+    session_last = ordered[0]
+    for ts in ordered[1:]:
+        if ts - session_last > gap:
+            span = min(session_last - session_start, max_session)
+            total += max(span.total_seconds(), SESSION_MIN_SECONDS)
+            session_start = ts
+        session_last = ts
+    span = min(session_last - session_start, max_session)
+    total += max(span.total_seconds(), SESSION_MIN_SECONDS)
+    return int(total)
+
+
+def _log_job_id(
+    log: Log,
+    image_job_map: dict[int, int | None],
+    box_job_map: dict[int, int | None],
+) -> int | None:
+    if log.target_type == LogTargetType.job:
+        return log.target_id
+    if log.target_type == LogTargetType.image:
+        return image_job_map.get(log.target_id)
+    if log.target_type == LogTargetType.box:
+        return box_job_map.get(log.target_id)
+    return None
+
+
+def _job_quality_issues(db: Session, job_id: int) -> list[TaskQualityIssue]:
+    issues: list[TaskQualityIssue] = []
+    rejected_boxes = (
+        db.query(func.count(Box.id))
+        .join(Image)
+        .filter(Image.job_id == job_id, Box.status == BoxStatus.Rejected)
+        .scalar()
+        or 0
+    )
+    if rejected_boxes:
+        issues.append(TaskQualityIssue(kind="rejected_box", label="Box bị reject", count=int(rejected_boxes)))
+
+    imgs = db.query(Image.tag).filter(Image.job_id == job_id).all()
+    tag_counts: dict[str, int] = {}
+    for (tags,) in imgs:
+        for tag in tags or []:
+            if tag in ERROR_IMAGE_TAGS:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    for tag, count in sorted(tag_counts.items()):
+        issues.append(TaskQualityIssue(kind="image_tag", label=tag, count=count))
+    return issues
+
+
+def _build_job_statistics(
+    db: Session,
+    task_id: int,
+    jobs: list[Job],
+    users_map: dict[int, str],
+    logs: list[Log],
+    image_job_map: dict[int, int | None],
+    box_job_map: dict[int, int | None],
+) -> list[TaskJobStatistics]:
+    job_ids = {j.id for j in jobs}
+    # Per (job_id, user_id): timestamps, event counts, submit/reject
+    timestamps: dict[tuple[int, int], list[datetime]] = {}
+    events: dict[tuple[int, int], dict[str, int]] = {}
+    submit_count: dict[tuple[int, int], int] = {}
+    reject_count: dict[tuple[int, int], int] = {}
+
+    for log in logs:
+        job_id = _log_job_id(log, image_job_map, box_job_map)
+        if job_id not in job_ids:
+            continue
+        key = (job_id, log.actor_id)
+        action = log.action
+        if action in ACTIVE_LOG_ACTIONS:
+            timestamps.setdefault(key, []).append(log.created_at)
+        if action in WORKING_LOG_ACTIONS:
+            bucket = events.setdefault(key, {})
+            bucket[action.value] = bucket.get(action.value, 0) + 1
+        if action == LogAction.submit_job:
+            submit_count[key] = submit_count.get(key, 0) + 1
+        if action == LogAction.reject_job:
+            reject_count[key] = reject_count.get(key, 0) + 1
+
+    out: list[TaskJobStatistics] = []
+    for idx, job in enumerate(jobs, start=1):
+        assignee_username = users_map.get(job.assignee_id) if job.assignee_id else None
+        if job.assignee_id and job.assignee_id not in users_map:
+            u = db.get(User, job.assignee_id)
+            if u:
+                users_map[job.assignee_id] = u.username
+                assignee_username = u.username
+
+        job_issues = _job_quality_issues(db, job.id)
+        user_ids = {uid for (jid, uid) in timestamps if jid == job.id}
+        user_ids.update(uid for (jid, uid) in events if jid == job.id)
+        user_ids.update(uid for (jid, uid) in submit_count if jid == job.id)
+        user_ids.update(uid for (jid, uid) in reject_count if jid == job.id)
+        if job.assignee_id:
+            user_ids.add(job.assignee_id)
+
+        users_out: list[TaskJobUserActivity] = []
+        for uid in user_ids:
+            key = (job.id, uid)
+            user_events = [
+                TaskEventCount(action=a, count=c)
+                for a, c in sorted(events.get(key, {}).items())
+            ]
+            user_events.sort(key=lambda e: (-e.count, e.action))
+            issues = list(job_issues) if uid == job.assignee_id else []
+            users_out.append(
+                TaskJobUserActivity(
+                    user_id=uid,
+                    username=users_map.get(uid, f"user#{uid}"),
+                    active_seconds=_estimate_active_seconds(timestamps.get(key, [])),
+                    events=user_events,
+                    issues=issues,
+                    submit_count=submit_count.get(key, 0),
+                    reject_count=reject_count.get(key, 0),
+                )
+            )
+        users_out.sort(
+            key=lambda u: (
+                0 if u.user_id == job.assignee_id else 1,
+                -u.active_seconds,
+                u.username.lower(),
+            )
+        )
+
+        if not users_out and job.assignee_id:
+            users_out.append(
+                TaskJobUserActivity(
+                    user_id=job.assignee_id,
+                    username=assignee_username or f"user#{job.assignee_id}",
+                    active_seconds=0,
+                    events=[],
+                    issues=job_issues,
+                    submit_count=0,
+                    reject_count=0,
+                )
+            )
+
+        out.append(
+            TaskJobStatistics(
+                job_id=job.id,
+                task_job_id=idx,
+                state=job.state.value,
+                assignee_id=job.assignee_id,
+                assignee_username=assignee_username,
+                img_num=count_job_images(db, job.id),
+                users=users_out,
+            )
+        )
+
+    return out
+
+
+def _merge_issues(into: dict[tuple[str, str], int], issues: list[TaskQualityIssue]) -> None:
+    for issue in issues:
+        key = (issue.kind, issue.label)
+        into[key] = into.get(key, 0) + issue.count
+
+
+def _issues_from_map(m: dict[tuple[str, str], int]) -> list[TaskQualityIssue]:
+    return [
+        TaskQualityIssue(kind=k, label=l, count=c)
+        for (k, l), c in sorted(m.items(), key=lambda x: (-x[1], x[0][1]))
+    ]
+
+
+def _build_user_overviews(
+    job_stats: list[TaskJobStatistics],
+    jobs: list[Job],
+) -> list[TaskUserOverview]:
+    assignee_counts: dict[int, int] = {}
+    for job in jobs:
+        if job.assignee_id:
+            assignee_counts[job.assignee_id] = assignee_counts.get(job.assignee_id, 0) + 1
+
+    acc: dict[int, dict] = {}
+
+    def ensure(uid: int, username: str) -> dict:
+        if uid not in acc:
+            acc[uid] = {
+                "username": username,
+                "active_seconds": 0,
+                "issue_map": {},
+                "submit_count": 0,
+                "reject_count": 0,
+                "jobs": [],
+            }
+        return acc[uid]
+
+    for job_stat in job_stats:
+        for u in job_stat.users:
+            bucket = ensure(u.user_id, u.username)
+            is_assignee = u.user_id == job_stat.assignee_id
+            bucket["active_seconds"] += u.active_seconds
+            bucket["submit_count"] += u.submit_count
+            bucket["reject_count"] += u.reject_count
+            _merge_issues(bucket["issue_map"], u.issues)
+            bucket["jobs"].append(
+                TaskUserJobActivity(
+                    job_id=job_stat.job_id,
+                    task_job_id=job_stat.task_job_id,
+                    state=job_stat.state,
+                    active_seconds=u.active_seconds,
+                    events=u.events,
+                    issues=u.issues,
+                    submit_count=u.submit_count,
+                    reject_count=u.reject_count,
+                    is_assignee=is_assignee,
+                )
+            )
+
+    out: list[TaskUserOverview] = []
+    for uid, bucket in acc.items():
+        jobs_list: list[TaskUserJobActivity] = bucket["jobs"]
+        jobs_list.sort(key=lambda j: (-j.active_seconds, j.task_job_id))
+        out.append(
+            TaskUserOverview(
+                user_id=uid,
+                username=bucket["username"],
+                active_seconds=bucket["active_seconds"],
+                issues=_issues_from_map(bucket["issue_map"]),
+                submit_count=bucket["submit_count"],
+                reject_count=bucket["reject_count"],
+                assigned_jobs=assignee_counts.get(uid, 0),
+                jobs=jobs_list,
+            )
+        )
+    out.sort(key=lambda u: (-u.active_seconds, u.username.lower()))
+    return out
+
+
 @router.get("/{task_id}/statistics", response_model=TaskStatisticsOut)
 def task_statistics(
     task_id: int, user: User = Depends(require_roles("admin")), db: Session = Depends(get_db)
@@ -381,7 +654,25 @@ def task_statistics(
                     users=section_users,
                 )
             )
-    return TaskStatisticsOut(sections=sections)
+
+    jobs = db.query(Job).filter(Job.task_id == task_id).order_by(Job.id.asc()).all()
+    image_job_map = {
+        i: j for i, j in db.query(Image.id, Image.job_id).filter(Image.task_id == task_id).all()
+    }
+    box_job_map = {
+        b: j
+        for b, j in db.query(Box.id, Image.job_id)
+        .join(Image)
+        .filter(Image.task_id == task_id)
+        .all()
+    }
+    all_logs = db.query(Log).filter(or_(*scope)).order_by(Log.created_at.asc()).all()
+    job_stats = _build_job_statistics(
+        db, task_id, jobs, users_map, all_logs, image_job_map, box_job_map
+    )
+    user_overviews = _build_user_overviews(job_stats, jobs)
+
+    return TaskStatisticsOut(sections=sections, users=user_overviews)
 
 
 @router.delete("/{task_id}")

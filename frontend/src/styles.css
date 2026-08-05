@@ -3611,6 +3611,7 @@ b {
   flex-direction: column;
   gap: 1.25rem;
   min-height: 12rem;
+  overflow: visible;
 }
 
 .task-stat-section {
@@ -3621,6 +3622,7 @@ b {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: rgba(15, 23, 42, 0.25);
+  overflow: visible;
 }
 
 .task-stat-section + .task-stat-section {
@@ -3683,12 +3685,14 @@ b {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+  overflow: visible;
 }
 
 .task-stat-user-row {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
+  overflow: visible;
 }
 
 .task-stat-user-head {
@@ -3715,19 +3719,325 @@ b {
   width: 100%;
   height: 1.35rem;
   border-radius: var(--radius-sm);
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid var(--border);
   background: var(--bg-deep);
 }
 
-.task-stat-segment {
+.task-stat-segment-wrap {
+  position: relative;
+  display: flex;
   min-width: 2px;
   height: 100%;
-  transition: opacity 0.12s ease;
+  cursor: default;
+  outline: none;
+}
+
+.task-stat-segment-wrap:first-child .task-stat-segment {
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+}
+
+.task-stat-segment-wrap:last-child .task-stat-segment {
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.task-stat-segment-wrap:only-child .task-stat-segment {
+  border-radius: var(--radius-sm);
+}
+
+.task-stat-segment {
+  width: 100%;
+  min-width: 2px;
+  height: 100%;
+  transition: filter 0.12s ease, box-shadow 0.12s ease;
+}
+
+.task-stat-segment-wrap:hover .task-stat-segment,
+.task-stat-segment-wrap:focus-visible .task-stat-segment {
+  filter: brightness(1.15);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
+  z-index: 1;
+}
+
+.task-stat-tooltip {
+  position: absolute;
+  bottom: calc(100% + 0.55rem);
+  left: 50%;
+  transform: translateX(-50%) translateY(6px) scale(0.96);
+  min-width: 9.5rem;
+  padding: 0.45rem 0.55rem 0.5rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: linear-gradient(165deg, rgba(30, 41, 59, 0.98) 0%, rgba(15, 23, 42, 0.98) 100%);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.14s ease,
+    transform 0.14s ease;
+  z-index: 20;
+  white-space: nowrap;
+}
+
+.task-stat-tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: rgba(30, 41, 59, 0.98);
+}
+
+.task-stat-segment-wrap:hover .task-stat-tooltip,
+.task-stat-segment-wrap:focus-visible .task-stat-tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+
+.task-stat-tooltip-owner {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-size: 0.62rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.task-stat-tooltip-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.2rem;
+}
+
+.task-stat-tooltip-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-transform: capitalize;
+}
+
+.task-stat-tooltip-metrics {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+}
+
+.task-stat-tooltip-metrics strong {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: #c7d2fe;
+}
+
+.task-stat-tooltip-sep {
+  opacity: 0.45;
 }
 
 .task-stat-segment:hover {
-  opacity: 0.82;
+  opacity: 1;
+}
+
+.task-stat-user-cell {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.task-stat-user-summary-issues {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.35rem;
+}
+
+.task-stat-summary-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.task-stat-job-user-block .task-stat-state {
+  margin-left: 0.4rem;
+  vertical-align: middle;
+}
+
+.task-stat-empty-inline {
+  padding: 0.5rem 0.25rem;
+  font-size: 0.82rem;
+}
+
+.task-stat-jobs-wrap {
+  overflow-x: auto;
+}
+
+.task-stat-jobs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.task-stat-jobs-table th,
+.task-stat-jobs-table td {
+  padding: 0.45rem 0.55rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.task-stat-jobs-table th {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.task-stat-job-row.has-issues td {
+  background: rgba(239, 68, 68, 0.04);
+}
+
+.task-stat-job-expand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-deep);
+  color: var(--text-secondary);
+  cursor: pointer;
+  line-height: 1;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.task-stat-job-expand svg {
+  transition: transform 0.18s ease;
+}
+
+.task-stat-job-expand.is-open svg {
+  transform: rotate(90deg);
+}
+
+.task-stat-job-expand:hover {
+  background: rgba(99, 102, 241, 0.12);
+  color: #c7d2fe;
+  border-color: rgba(99, 102, 241, 0.35);
+}
+
+.task-stat-job-row.open .task-stat-job-expand {
+  background: rgba(99, 102, 241, 0.16);
+  color: #c7d2fe;
+  border-color: rgba(99, 102, 241, 0.4);
+}
+
+.task-stat-state {
+  display: inline-block;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  text-transform: lowercase;
+  border: 1px solid var(--border);
+}
+
+.task-stat-state.state-rejected {
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.task-stat-state.state-completed {
+  color: #86efac;
+  border-color: rgba(34, 197, 94, 0.45);
+  background: rgba(34, 197, 94, 0.12);
+}
+
+.task-stat-state.state-need_review,
+.task-stat-state.state-in_progress {
+  color: #7dd3fc;
+  border-color: rgba(56, 189, 248, 0.45);
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.task-stat-issue-badge {
+  display: inline-block;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.14);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.task-stat-issues-cell {
+  max-width: 8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-stat-job-detail-row td {
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.task-stat-job-detail {
+  padding: 0.65rem 0.75rem 0.85rem 2.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.task-stat-job-detail-meta {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.task-stat-job-user-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.task-stat-assignee-tag {
+  margin-left: 0.4rem;
+  padding: 0.08rem 0.35rem;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 500;
+  color: #c7d2fe;
+  background: rgba(99, 102, 241, 0.18);
+  border: 1px solid rgba(99, 102, 241, 0.35);
+  vertical-align: middle;
+}
+
+.task-stat-issue-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.task-stat-issue-chip {
+  display: inline-block;
+  padding: 0.15rem 0.45rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.68rem;
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.28);
+}
+
+.task-stat-bar-sm {
+  height: 1rem;
 }
 
 .job-stage-tabs {
